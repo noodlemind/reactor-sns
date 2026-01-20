@@ -60,10 +60,9 @@ class AsyncFifoSnsPublisherTest {
             for (String groupId : groupIds) {
                 // Sequence number is 'i'
                 inputEvents.add(new SnsEvent(
-                    groupId, 
-                    groupId + "-dedup-" + i, 
-                    "payload-" + i, 
-                    String.valueOf(i)
+                    groupId,
+                    groupId + "-dedup-" + i,
+                    "payload-" + i
                 ));
             }
         }
@@ -136,7 +135,7 @@ class AsyncFifoSnsPublisherTest {
         // If it tries to send 20 or 100 at once, the Mock above will throw an exception and fail the test.
         List<SnsEvent> events = new ArrayList<>();
         for (int i = 0; i < 105; i++) {
-            events.add(new SnsEvent("GroupZ", "id-" + i, "payload-" + i, String.valueOf(i)));
+            events.add(new SnsEvent("GroupZ", "id-" + i, "payload-" + i));
         }
 
         Flux<SnsEvent> eventStream = Flux.fromIterable(events);
