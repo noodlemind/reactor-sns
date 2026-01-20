@@ -5,8 +5,9 @@
   <artifactId>async-fifo-sns-publisher</artifactId>
   <version>1.0-SNAPSHOT</version>
   <properties>
-    <maven.compiler.source>17</maven.compiler.source>
-    <maven.compiler.target>17</maven.compiler.target>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <aws.java.sdk.version>2.29.0</aws.java.sdk.version>
     <spring.boot.version>3.3.0</spring.boot.version>
   </properties>
@@ -35,6 +36,12 @@
     <dependency>
       <groupId>software.amazon.awssdk</groupId>
       <artifactId>sns</artifactId>
+      <exclusions>
+        <exclusion>
+          <groupId>commons-logging</groupId>
+          <artifactId>commons-logging</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     
     <!-- AWS CRT HTTP Client - recommended for production (faster, lower memory, no deprecated API warnings) -->
@@ -47,6 +54,12 @@
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter</artifactId>
+      <exclusions>
+        <exclusion>
+          <groupId>commons-logging</groupId>
+          <artifactId>commons-logging</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <dependency>
         <groupId>org.springframework.boot</groupId>
@@ -101,6 +114,14 @@
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <release>17</release>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
         <configuration>
@@ -109,6 +130,7 @@
             -XX:+EnableDynamicAgentLoading
             --add-opens java.base/java.lang=ALL-UNNAMED
             --add-opens java.base/java.util=ALL-UNNAMED
+            --enable-native-access=ALL-UNNAMED
           </argLine>
         </configuration>
       </plugin>
