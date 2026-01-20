@@ -1,4 +1,4 @@
-package com.example.snspublisher.model;
+package io.clype.reactorsns.model;
 
 import java.util.Objects;
 

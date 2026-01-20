@@ -1,17 +1,20 @@
-package com.example.snspublisher.config;
+package io.clype.reactorsns.config;
 
-import com.example.snspublisher.service.AsyncFifoSnsPublisher;
+import java.time.Duration;
+
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+
+import io.clype.reactorsns.service.AsyncFifoSnsPublisher;
+
 import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
 import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
+import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
-
-import java.time.Duration;
 
 /**
  * Spring Boot auto-configuration for the async FIFO SNS publisher.
@@ -89,11 +92,11 @@ public class SnsPublisherAutoConfiguration {
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     public SnsAsyncClient snsAsyncClient(SdkAsyncHttpClient httpClient) {
-        software.amazon.awssdk.services.sns.SnsAsyncClientBuilder builder = SnsAsyncClient.builder()
+        var builder = SnsAsyncClient.builder()
                 .httpClient(httpClient);
 
         if (properties.getRegion() != null && !properties.getRegion().isEmpty()) {
-            builder.region(software.amazon.awssdk.regions.Region.of(properties.getRegion()));
+            builder.region(Region.of(properties.getRegion()));
         }
 
         return builder.build();

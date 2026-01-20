@@ -1,4 +1,4 @@
-package com.example.snspublisher.service;
+package io.clype.reactorsns.service;
 
 import java.io.IOException;
 import java.net.SocketTimeoutException;
@@ -15,7 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
 
-import com.example.snspublisher.model.SnsEvent;
+import io.clype.reactorsns.model.SnsEvent;
 
 import reactor.core.publisher.BufferOverflowStrategy;
 import reactor.core.publisher.Flux;
@@ -73,7 +73,7 @@ import software.amazon.awssdk.services.sns.model.SnsException;
  * automatically clean up its thread pool when the Spring context is destroyed.</p>
  *
  * @see SnsEvent
- * @see com.example.snspublisher.config.SnsPublisherAutoConfiguration
+ * @see io.clype.reactorsns.config.SnsPublisherAutoConfiguration
  */
 public class AsyncFifoSnsPublisher implements DisposableBean {
 
@@ -219,7 +219,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
                 .retryWhen(Retry.backoff(3, Duration.ofMillis(100))
                         .maxBackoff(Duration.ofSeconds(5))
                         .jitter(0.5)
-                        .filter(throwable -> isRetryableException(throwable))
+                        .filter(this::isRetryableException)
                         .doBeforeRetry(signal ->
                             log.warn("Retrying batch publication (attempt {}): {}",
                                 signal.totalRetries() + 1, signal.failure().getMessage())))

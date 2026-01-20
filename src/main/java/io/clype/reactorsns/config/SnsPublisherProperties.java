@@ -1,7 +1,8 @@
-package com.example.snspublisher.config;
+package io.clype.reactorsns.config;
+
+import java.time.Duration;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
-import java.time.Duration;
 
 /**
  * Configuration properties for the async FIFO SNS publisher.
@@ -47,42 +48,80 @@ public class SnsPublisherProperties {
      */
     private Duration batchTimeout = Duration.ofMillis(10);
 
-    /** Returns the SNS topic ARN. */
+    /**
+     * Creates a new SnsPublisherProperties with default values.
+     */
+    public SnsPublisherProperties() {
+    }
+
+    /**
+     * Returns the SNS topic ARN.
+     *
+     * @return the SNS topic ARN
+     */
     public String getTopicArn() {
         return topicArn;
     }
 
-    /** Sets the SNS topic ARN. */
+    /**
+     * Sets the SNS topic ARN.
+     *
+     * @param topicArn the SNS topic ARN
+     */
     public void setTopicArn(String topicArn) {
         this.topicArn = topicArn;
     }
 
-    /** Returns the AWS region. */
+    /**
+     * Returns the AWS region.
+     *
+     * @return the AWS region
+     */
     public String getRegion() {
         return region;
     }
 
-    /** Sets the AWS region. */
+    /**
+     * Sets the AWS region.
+     *
+     * @param region the AWS region
+     */
     public void setRegion(String region) {
         this.region = region;
     }
 
-    /** Returns the partition count. */
+    /**
+     * Returns the partition count.
+     *
+     * @return the partition count
+     */
     public int getPartitionCount() {
         return partitionCount;
     }
 
-    /** Sets the partition count. */
+    /**
+     * Sets the partition count.
+     *
+     * @param partitionCount the partition count
+     */
     public void setPartitionCount(int partitionCount) {
         this.partitionCount = partitionCount;
     }
 
-    /** Returns the batch timeout. */
+    /**
+     * Returns the batch timeout.
+     *
+     * @return the batch timeout
+     */
     public Duration getBatchTimeout() {
         return batchTimeout;
     }
 
-    /** Sets the batch timeout. */
+    /**
+     * Sets the batch timeout.
+     *
+     * @param batchTimeout the batch timeout
+     */
     public void setBatchTimeout(Duration batchTimeout) {
         this.batchTimeout = batchTimeout;
     }

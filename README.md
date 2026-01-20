@@ -38,6 +38,9 @@ sns:
 Inject and use:
 
 ```java
+import io.clype.reactorsns.model.SnsEvent;
+import io.clype.reactorsns.service.AsyncFifoSnsPublisher;
+
 @Service
 public class MyService {
     private final AsyncFifoSnsPublisher publisher;

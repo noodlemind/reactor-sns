@@ -1,20 +1,18 @@
-package com.example.snspublisher;
-
-import com.example.snspublisher.config.SnsPublisherAutoConfiguration;
-import com.example.snspublisher.config.SnsPublisherProperties;
-import com.example.snspublisher.service.AsyncFifoSnsPublisher;
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.AutoConfigurations;
-import org.springframework.boot.test.context.runner.ApplicationContextRunner;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import software.amazon.awssdk.services.sns.SnsAsyncClient;
+package io.clype.reactorsns;
 
 import java.time.Duration;
 
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+
+import io.clype.reactorsns.config.SnsPublisherAutoConfiguration;
+import io.clype.reactorsns.config.SnsPublisherProperties;
+import io.clype.reactorsns.service.AsyncFifoSnsPublisher;
+
+import software.amazon.awssdk.services.sns.SnsAsyncClient;
+
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
 
 class LibrarySmokeTest {
 

@@ -1,27 +1,35 @@
-package com.example.snspublisher.service;
+package io.clype.reactorsns.service;
 
-import com.example.snspublisher.model.SnsEvent;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+
+import io.clype.reactorsns.model.SnsEvent;
+
+import reactor.core.publisher.Flux;
+import reactor.test.StepVerifier;
+
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequest;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequestEntry;
 import software.amazon.awssdk.services.sns.model.PublishBatchResponse;
 import software.amazon.awssdk.services.sns.model.PublishBatchResultEntry;
-import reactor.core.publisher.Flux;
-import reactor.test.StepVerifier;
-
-import java.time.Duration;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.*;
+import static org.mockito.Mockito.atLeast;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class AsyncFifoSnsPublisherTest {
 
@@ -72,23 +80,23 @@ class AsyncFifoSnsPublisherTest {
 
         // ACTION: Publish events
         StepVerifier.create(publisher.publishEvents(eventStream))
-            // We expect: (60 events total) / (batch size 10) = ~6 batches if perfectly efficient, 
-            // but due to partitioning and buffering timing, might be more. 
+            // We expect: (60 events total) / (batch size 10) = ~6 batches if perfectly efficient,
+            // but due to partitioning and buffering timing, might be more.
             // We just verify completion and then check the captured requests.
-            .expectNextCount(6) 
+            .expectNextCount(6)
             .expectComplete()
             .verify(Duration.ofSeconds(5));
 
         // VERIFICATION: Inspect what was sent to SNS
         ArgumentCaptor<PublishBatchRequest> captor = ArgumentCaptor.forClass(PublishBatchRequest.class);
         verify(snsClient, atLeast(1)).publishBatch(captor.capture());
-        
+
         List<PublishBatchRequest> sentRequests = captor.getAllValues();
         System.out.println("Total batches sent: " + sentRequests.size());
 
         // Reconstruct the timeline for each group from the batches
         Map<String, List<Integer>> groupSequences = new HashMap<>();
-        
+
         for (PublishBatchRequest req : sentRequests) {
             // Note: A single batch might contain mixed groups if they hashed to the same partition
             // and were buffered together. This is allowed in SNS FIFO.
@@ -97,7 +105,7 @@ class AsyncFifoSnsPublisherTest {
                 // Extract sequence from payload, format is "payload-X"
                 String payload = entry.message();
                 int sequence = Integer.parseInt(payload.replace("payload-", ""));
-                
+
                 groupSequences.computeIfAbsent(groupId, k -> new ArrayList<>()).add(sequence);
             }
         }
@@ -106,12 +114,12 @@ class AsyncFifoSnsPublisherTest {
         for (String groupId : groupIds) {
             List<Integer> sequence = groupSequences.get(groupId);
             System.out.println("Verifying sequence for " + groupId + ": " + sequence);
-            
+
             assertEquals(eventsPerGroup, sequence.size(), "Should have all events for " + groupId);
-            
+
             // Verify strict ascending order: 0, 1, 2, ... 19
             for (int i = 0; i < eventsPerGroup; i++) {
-                assertEquals(i, sequence.get(i), 
+                assertEquals(i, sequence.get(i),
                     "Sequence mismatch for " + groupId + " at index " + i);
             }
         }
@@ -150,12 +158,12 @@ class AsyncFifoSnsPublisherTest {
         verify(snsClient, times(11)).publishBatch(captor.capture());
 
         List<PublishBatchRequest> requests = captor.getAllValues();
-        
+
         // Count full batches
         long fullBatches = requests.stream()
             .filter(req -> req.publishBatchRequestEntries().size() == 10)
             .count();
-            
+
         long partialBatches = requests.stream()
             .filter(req -> req.publishBatchRequestEntries().size() == 5)
             .count();
