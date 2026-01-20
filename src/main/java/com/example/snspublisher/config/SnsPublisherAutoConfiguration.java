@@ -63,7 +63,7 @@ public class SnsPublisherAutoConfiguration {
      *
      * @return the configured async HTTP client
      */
-    @Bean
+    @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     public SdkAsyncHttpClient nettyHttpClient() {
         return NettyNioAsyncHttpClient.builder()
@@ -87,7 +87,7 @@ public class SnsPublisherAutoConfiguration {
      * @param httpClient the async HTTP client to use for API calls
      * @return the configured SNS async client
      */
-    @Bean
+    @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     public SnsAsyncClient snsAsyncClient(SdkAsyncHttpClient httpClient) {
         software.amazon.awssdk.services.sns.SnsAsyncClientBuilder builder = SnsAsyncClient.builder()
