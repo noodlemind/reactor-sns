@@ -8,7 +8,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
-import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient;
+import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
 
 import java.time.Duration;
@@ -36,6 +36,9 @@ import java.time.Duration;
  * <p><b>AWS Credentials:</b> The SNS client uses the default AWS credential provider chain.
  * Configure credentials via environment variables, system properties, or IAM roles.</p>
  *
+ * <p><b>HTTP Client:</b> Uses AWS Common Runtime (CRT) HTTP client for optimal performance
+ * and reduced memory usage in production environments.</p>
+ *
  * @see SnsPublisherProperties
  * @see AsyncFifoSnsPublisher
  */
@@ -56,25 +59,21 @@ public class SnsPublisherAutoConfiguration {
     }
 
     /**
-     * Creates a Netty-based async HTTP client optimized for high-throughput SNS publishing.
+     * Creates an AWS CRT-based async HTTP client optimized for high-throughput SNS publishing.
      *
-     * <p>The client is configured with connection pooling sized to match the partition count,
-     * appropriate timeouts, and TCP keep-alive enabled.</p>
+     * <p>The AWS CRT (Common Runtime) HTTP client provides better performance and lower
+     * memory usage compared to Netty, and is AWS's recommended HTTP client for production
+     * workloads.</p>
      *
      * @return the configured async HTTP client
      */
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
-    public SdkAsyncHttpClient nettyHttpClient() {
-        return NettyNioAsyncHttpClient.builder()
-                // IMPORTANT: Max Concurrency must be >= Partition Count (256)
-                // We set it to 500 to allow headroom for retries and other operations.
+    public SdkAsyncHttpClient awsCrtHttpClient() {
+        return AwsCrtAsyncHttpClient.builder()
                 .maxConcurrency(Math.max(500, properties.getPartitionCount() * 2))
-                .connectionAcquisitionTimeout(Duration.ofSeconds(10))
                 .connectionTimeout(Duration.ofSeconds(10))
-                .readTimeout(Duration.ofSeconds(30))
-                .writeTimeout(Duration.ofSeconds(30))
-                .tcpKeepAlive(true)
+                .connectionMaxIdleTime(Duration.ofSeconds(60))
                 .build();
     }
 

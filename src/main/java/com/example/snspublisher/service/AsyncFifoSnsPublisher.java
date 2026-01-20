@@ -91,13 +91,17 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * @param topicArn       the ARN of the SNS FIFO topic (must end with .fifo)
      * @param partitionCount number of logical partitions for parallel processing (default: 256)
      * @param batchTimeout   maximum time to wait for a batch to fill before sending (default: 10ms)
-     * @throws NullPointerException if snsClient or topicArn is null
+     * @throws NullPointerException if snsClient, topicArn, or batchTimeout is null
+     * @throws IllegalArgumentException if partitionCount is not positive
      */
     public AsyncFifoSnsPublisher(SnsAsyncClient snsClient, String topicArn, int partitionCount, Duration batchTimeout) {
-        this.snsClient = snsClient;
-        this.topicArn = topicArn;
+        this.snsClient = java.util.Objects.requireNonNull(snsClient, "snsClient cannot be null");
+        this.topicArn = java.util.Objects.requireNonNull(topicArn, "topicArn cannot be null");
+        this.batchTimeout = java.util.Objects.requireNonNull(batchTimeout, "batchTimeout cannot be null");
+        if (partitionCount <= 0) {
+            throw new IllegalArgumentException("partitionCount must be positive");
+        }
         this.partitionCount = partitionCount;
-        this.batchTimeout = batchTimeout;
         // Bounded elastic scheduler is ideal for I/O intensive tasks
         this.ioScheduler = Schedulers.newBoundedElastic(
                 partitionCount + 50,

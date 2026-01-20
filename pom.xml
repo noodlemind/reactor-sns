@@ -7,8 +7,8 @@
   <properties>
     <maven.compiler.source>17</maven.compiler.source>
     <maven.compiler.target>17</maven.compiler.target>
-    <aws.java.sdk.version>2.25.0</aws.java.sdk.version>
-    <spring.boot.version>3.2.0</spring.boot.version>
+    <aws.java.sdk.version>2.29.0</aws.java.sdk.version>
+    <spring.boot.version>3.3.0</spring.boot.version>
   </properties>
 
   <dependencyManagement>
@@ -37,11 +37,13 @@
       <artifactId>sns</artifactId>
     </dependency>
     
-    <!-- Spring & Reactor -->
+    <!-- AWS CRT HTTP Client - recommended for production (faster, lower memory, no deprecated API warnings) -->
     <dependency>
       <groupId>software.amazon.awssdk</groupId>
-      <artifactId>netty-nio-client</artifactId>
+      <artifactId>aws-crt-client</artifactId>
     </dependency>
+
+    <!-- Spring & Reactor -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter</artifactId>
@@ -102,7 +104,12 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
         <configuration>
-          <argLine>-Dnet.bytebuddy.experimental=true</argLine>
+          <argLine>
+            -Dnet.bytebuddy.experimental=true
+            -XX:+EnableDynamicAgentLoading
+            --add-opens java.base/java.lang=ALL-UNNAMED
+            --add-opens java.base/java.util=ALL-UNNAMED
+          </argLine>
         </configuration>
       </plugin>
       <plugin>
