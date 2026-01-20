@@ -1,27 +1,34 @@
 package com.example.snspublisher.service;
 
-import com.example.snspublisher.model.SnsEvent;
+import java.io.IOException;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+import javax.net.ssl.SSLException;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
+
+import com.example.snspublisher.model.SnsEvent;
+
+import reactor.core.publisher.BufferOverflowStrategy;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
+import reactor.util.retry.Retry;
+
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequest;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequestEntry;
 import software.amazon.awssdk.services.sns.model.PublishBatchResponse;
 import software.amazon.awssdk.services.sns.model.SnsException;
-import reactor.core.publisher.BufferOverflowStrategy;
-import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
-import reactor.util.retry.Retry;
-
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.stream.Collectors;
-
-import reactor.core.scheduler.Schedulers;
-import reactor.core.scheduler.Scheduler;
 
 /**
  * High-throughput asynchronous publisher for AWS SNS FIFO topics.
@@ -95,9 +102,9 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * @throws IllegalArgumentException if partitionCount is not positive
      */
     public AsyncFifoSnsPublisher(SnsAsyncClient snsClient, String topicArn, int partitionCount, Duration batchTimeout) {
-        this.snsClient = java.util.Objects.requireNonNull(snsClient, "snsClient cannot be null");
-        this.topicArn = java.util.Objects.requireNonNull(topicArn, "topicArn cannot be null");
-        this.batchTimeout = java.util.Objects.requireNonNull(batchTimeout, "batchTimeout cannot be null");
+        this.snsClient = Objects.requireNonNull(snsClient, "snsClient cannot be null");
+        this.topicArn = Objects.requireNonNull(topicArn, "topicArn cannot be null");
+        this.batchTimeout = Objects.requireNonNull(batchTimeout, "batchTimeout cannot be null");
         if (partitionCount <= 0) {
             throw new IllegalArgumentException("partitionCount must be positive");
         }
@@ -223,7 +230,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
                                 batch.size(),
                                 response.failed().stream()
                                     .map(e -> e.id())
-                                    .collect(java.util.stream.Collectors.joining(", ")));
+                                    .collect(Collectors.joining(", ")));
                         return Mono.error(new RuntimeException(
                                 "Partial batch failure: " + response.failed().size() + " messages failed"));
                     }
@@ -258,9 +265,9 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * Checks if the exception is a network-related transient failure.
      */
     private boolean isNetworkException(Throwable t) {
-        return t instanceof java.net.SocketTimeoutException ||
-               t instanceof java.io.IOException ||
-               t instanceof javax.net.ssl.SSLException ||
+        return t instanceof SocketTimeoutException ||
+               t instanceof IOException ||
+               t instanceof SSLException ||
                t.getClass().getName().equals("io.netty.handler.timeout.ReadTimeoutException") ||
                t.getClass().getName().equals("io.netty.handler.timeout.WriteTimeoutException");
     }
