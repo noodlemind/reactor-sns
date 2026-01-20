@@ -66,7 +66,7 @@ import reactor.core.scheduler.Scheduler;
  * automatically clean up its thread pool when the Spring context is destroyed.</p>
  *
  * @see SnsEvent
- * @see SnsPublisherAutoConfiguration
+ * @see com.example.snspublisher.config.SnsPublisherAutoConfiguration
  */
 public class AsyncFifoSnsPublisher implements DisposableBean {
 

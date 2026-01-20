@@ -47,34 +47,42 @@ public class SnsPublisherProperties {
      */
     private Duration batchTimeout = Duration.ofMillis(10);
 
+    /** Returns the SNS topic ARN. */
     public String getTopicArn() {
         return topicArn;
     }
 
+    /** Sets the SNS topic ARN. */
     public void setTopicArn(String topicArn) {
         this.topicArn = topicArn;
     }
 
+    /** Returns the AWS region. */
     public String getRegion() {
         return region;
     }
 
+    /** Sets the AWS region. */
     public void setRegion(String region) {
         this.region = region;
     }
 
+    /** Returns the partition count. */
     public int getPartitionCount() {
         return partitionCount;
     }
 
+    /** Sets the partition count. */
     public void setPartitionCount(int partitionCount) {
         this.partitionCount = partitionCount;
     }
 
+    /** Returns the batch timeout. */
     public Duration getBatchTimeout() {
         return batchTimeout;
     }
 
+    /** Sets the batch timeout. */
     public void setBatchTimeout(Duration batchTimeout) {
         this.batchTimeout = batchTimeout;
     }

@@ -39,6 +39,9 @@ public record SnsEvent(
     /**
      * Creates a new SnsEvent with validation.
      *
+     * @param messageGroupId the message group ID for FIFO ordering
+     * @param messageDeduplicationId the deduplication ID
+     * @param payload the message content
      * @throws NullPointerException     if messageGroupId or messageDeduplicationId is null
      * @throws IllegalArgumentException if messageGroupId or messageDeduplicationId exceeds 128 characters
      */
