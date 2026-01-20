@@ -135,9 +135,11 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      *   <li>Non-retryable errors (validation, authorization) fail immediately.</li>
      * </ul>
      *
-     * <p><b>Backpressure:</b> If the publisher cannot keep up with the input stream,
-     * older events will be dropped and logged. Configure {@code partitionCount} and
-     * {@code batchTimeout} to tune throughput.</p>
+     * <p><b>Backpressure:</b> If the publisher cannot keep up with the input stream
+     * and the internal buffer (100,000 events) is exhausted, an error is emitted.
+     * This fail-fast behavior preserves FIFO ordering guarantees by preventing
+     * silent data loss. Configure {@code partitionCount} and {@code batchTimeout}
+     * to tune throughput, or implement upstream flow control.</p>
      *
      * @param eventStream the stream of events to publish (must not be null)
      * @return a Flux emitting {@link PublishBatchResponse} for each successfully
@@ -146,9 +148,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      */
     public Flux<PublishBatchResponse> publishEvents(Flux<SnsEvent> eventStream) {
         return eventStream
-                .onBackpressureBuffer(100000,
-                    dropped -> log.warn("Dropped event due to backpressure: {}", dropped.messageGroupId()),
-                    BufferOverflowStrategy.DROP_OLDEST)
+                .onBackpressureBuffer(100000, BufferOverflowStrategy.ERROR)
                 .groupBy(event -> (event.messageGroupId().hashCode() & Integer.MAX_VALUE) % partitionCount)
                 .flatMap(partitionFlux -> partitionFlux
                         .publishOn(ioScheduler)
