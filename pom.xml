@@ -2,8 +2,26 @@
   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <groupId>io.clype</groupId>
-  <artifactId>async-fifo-sns-publisher</artifactId>
-  <version>1.0-SNAPSHOT</version>
+  <artifactId>reactor-sns</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <name>Reactor SNS</name>
+  <description>High-throughput reactive SNS publisher for FIFO topics using Project Reactor</description>
+  <url>https://github.com/noodlemind/reactor-sns</url>
+
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+    </license>
+  </licenses>
+
+  <scm>
+    <connection>scm:git:git://github.com/noodlemind/reactor-sns.git</connection>
+    <developerConnection>scm:git:ssh://github.com:noodlemind/reactor-sns.git</developerConnection>
+    <url>https://github.com/noodlemind/reactor-sns</url>
+  </scm>
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>

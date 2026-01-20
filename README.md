@@ -1,88 +1,91 @@
-# Async FIFO SNS Publisher
+# Reactor SNS
 
-A high-throughput, asynchronous Amazon SNS publisher library for Spring Boot applications. This library ensures FIFO (First-In-First-Out) message ordering by leveraging SNS FIFO topics and provides efficient batching capabilities using Project Reactor.
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Java](https://img.shields.io/badge/Java-17%2B-blue)](https://openjdk.org/)
+
+High-throughput reactive Amazon SNS publisher for FIFO topics using Project Reactor.
 
 ## Features
 
-- **High Throughput**: Uses parallel processing and batching to maximize SNS throughput.
-- **FIFO Ordering**: Preserves message ordering within message groups using SNS FIFO topics.
-- **Asynchronous**: Built on top of the AWS SDK v2 Async Client and Project Reactor.
-- **Auto-Configuration**: seamless integration with Spring Boot.
-- **Configurable**: Customizable partition counts, batch sizes, and timeouts.
+- **High Throughput**: Parallel processing across configurable partitions with automatic batching
+- **FIFO Ordering**: Preserves message ordering within message groups
+- **Reactive**: Built on Project Reactor with full backpressure support
+- **Production Ready**: AWS CRT HTTP client, retry with exponential backoff, proper resource cleanup
+- **Spring Boot**: Auto-configuration with `@ConditionalOnMissingBean` for customization
 
 ## Installation
 
-Add the following dependency to your `pom.xml`:
+Add the dependency to your `pom.xml`:
 
 ```xml
 <dependency>
     <groupId>io.clype</groupId>
-    <artifactId>async-fifo-sns-publisher</artifactId>
-    <version>1.0-SNAPSHOT</version>
+    <artifactId>reactor-sns</artifactId>
+    <version>1.0.0</version>
 </dependency>
 ```
 
-## Configuration
+## Quick Start
 
-Configure the library in your `application.yml` or `application.properties`:
+Configure in `application.yml`:
 
 ```yaml
 sns:
   publisher:
     topic-arn: arn:aws:sns:us-east-1:123456789012:MyTopic.fifo
-    region: us-east-1             # Optional, defaults to AWS Default Region Provider Chain
-    partition-count: 256          # Optional, default: 256
-    batch-size: 10                # Optional, default: 10 (Max allowed by SNS)
-    batch-timeout: 10ms           # Optional, default: 10ms
 ```
 
-### Properties Reference
-
-| Property | Default | Description |
-|----------|---------|-------------|
-| `sns.publisher.topic-arn` | **Required** | The ARN of the SNS FIFO topic. |
-| `sns.publisher.region` | `null` | AWS Region (e.g., `us-east-1`). If not set, uses the default AWS provider chain. |
-| `sns.publisher.partition-count` | `256` | Logical partitions for parallel processing. Higher values increase parallelism. |
-| `sns.publisher.batch-size` | `10` | Maximum number of messages to send in a single `PublishBatch` request. |
-| `sns.publisher.batch-timeout` | `10ms` | Maximum time to wait for a batch to fill before sending. |
-
-## Usage
-
-Inject `AsyncFifoSnsPublisher` into your service and publish events:
+Inject and use:
 
 ```java
-import com.example.snspublisher.service.AsyncFifoSnsPublisher;
-import com.example.snspublisher.model.SnsEvent;
-import org.springframework.stereotype.Service;
-import reactor.core.publisher.Flux;
-
 @Service
-public class MyMessagingService {
-
+public class MyService {
     private final AsyncFifoSnsPublisher publisher;
 
-    public MyMessagingService(AsyncFifoSnsPublisher publisher) {
+    public MyService(AsyncFifoSnsPublisher publisher) {
         this.publisher = publisher;
     }
 
-    public void sendMessages() {
-        SnsEvent event1 = new SnsEvent("group-id-1", "dedup-id-1", "payload-1");
-        SnsEvent event2 = new SnsEvent("group-id-1", "dedup-id-2", "payload-2");
-
-        publisher.publishEvents(Flux.just(event1, event2))
-                .subscribe(response -> System.out.println("Published batch: " + response));
+    public Mono<Void> publish(String groupId, String payload) {
+        SnsEvent event = new SnsEvent(groupId, UUID.randomUUID().toString(), payload);
+        return publisher.publishEvents(Flux.just(event)).then();
     }
 }
 ```
 
+## Configuration
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `sns.publisher.topic-arn` | Required | SNS FIFO topic ARN |
+| `sns.publisher.region` | AWS default | AWS region |
+| `sns.publisher.partition-count` | `256` | Parallel processing partitions |
+| `sns.publisher.batch-timeout` | `10ms` | Max wait time before sending batch |
+
+## How It Works
+
+```
+Input Stream → Backpressure Buffer → Group by Message Group ID
+                                              ↓
+                                    Partition (hash % N)
+                                              ↓
+                              ┌───────────────┼───────────────┐
+                              ↓               ↓               ↓
+                         Partition 0    Partition 1    Partition N
+                              ↓               ↓               ↓
+                         Buffer/Batch   Buffer/Batch   Buffer/Batch
+                              ↓               ↓               ↓
+                         SNS Publish    SNS Publish    SNS Publish
+```
+
+Messages with the same `messageGroupId` always route to the same partition, ensuring FIFO ordering per group while enabling parallel processing across groups.
+
 ## Requirements
 
 - Java 17+
-- Spring Boot 3+
+- Spring Boot 3.x
 - AWS SDK v2
 
-## Building from Source
+## License
 
-```bash
-mvn clean install
-```
+[Apache License 2.0](LICENSE)
