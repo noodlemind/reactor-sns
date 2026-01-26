@@ -6,6 +6,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -82,11 +83,19 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
 
     private static final Logger log = LoggerFactory.getLogger(AsyncFifoSnsPublisher.class);
 
+    // ==========================================================================
+    // Constants - AWS SNS Limits
+    // ==========================================================================
+
     /** SNS FIFO maximum messages per PublishBatch API call (AWS hard limit). */
     public static final int MAX_BATCH_SIZE = 10;
 
     /** SNS FIFO maximum payload size per batch: 256 KB (AWS hard limit). */
     public static final int MAX_PAYLOAD_SIZE_BYTES = 256 * 1024;
+
+    // ==========================================================================
+    // Constants - Validation Patterns
+    // ==========================================================================
 
     /** Pattern for validating SNS FIFO topic ARNs (supports all AWS partitions). */
     private static final Pattern SNS_FIFO_ARN_PATTERN = Pattern.compile(
@@ -95,14 +104,43 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     /** Pattern for sanitizing log output - removes all control characters. */
     private static final Pattern LOG_SANITIZE_PATTERN = Pattern.compile("[\\p{Cntrl}\\p{Cc}]");
 
-    private final int partitionCount;
-    private final Duration batchTimeout;
+    // ==========================================================================
+    // Constants - Retry Configuration
+    // ==========================================================================
+
+    /** Maximum number of retry attempts for transient failures. */
+    private static final int MAX_RETRIES = 3;
+
+    /** Minimum backoff duration between retries. */
+    private static final Duration RETRY_MIN_BACKOFF = Duration.ofMillis(100);
+
+    /** Maximum backoff duration between retries. */
+    private static final Duration RETRY_MAX_BACKOFF = Duration.ofSeconds(5);
+
+    /** Jitter factor for retry backoff (0.5 = 50% randomization). */
+    private static final double RETRY_JITTER = 0.5;
+
+    /** AWS error codes that indicate transient failures eligible for retry. */
+    private static final Set<String> RETRYABLE_ERROR_CODES = Set.of(
+            "Throttling", "InternalError", "ServiceUnavailable"
+    );
+
+    // ==========================================================================
+    // Fields
+    // ==========================================================================
+
     private final SnsAsyncClient snsClient;
     private final String topicArn;
-    private final Scheduler ioScheduler;
+    private final int partitionCount;
+    private final Duration batchTimeout;
     private final int bufferSize;
     private final int partitionBufferSize;
     private final SnsPublisherMetrics metrics;
+    private final Scheduler ioScheduler;
+
+    // ==========================================================================
+    // Constructors
+    // ==========================================================================
 
     /**
      * Creates a new AsyncFifoSnsPublisher with default buffer sizes and no metrics.
@@ -114,7 +152,8 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * @throws NullPointerException if snsClient, topicArn, or batchTimeout is null
      * @throws IllegalArgumentException if partitionCount is not positive
      */
-    public AsyncFifoSnsPublisher(SnsAsyncClient snsClient, String topicArn, int partitionCount, Duration batchTimeout) {
+    public AsyncFifoSnsPublisher(SnsAsyncClient snsClient, String topicArn,
+                                  int partitionCount, Duration batchTimeout) {
         this(snsClient, topicArn, partitionCount, batchTimeout, 10_000, 100, null);
     }
 
@@ -130,7 +169,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * @param metrics              optional metrics collector (may be null)
      * @throws NullPointerException if snsClient, topicArn, or batchTimeout is null
      * @throws IllegalArgumentException if partitionCount, bufferSize, or partitionBufferSize is not positive
-     * @throws IllegalArgumentException if topicArn does not end with .fifo
+     * @throws IllegalArgumentException if topicArn does not match SNS FIFO ARN format
      */
     public AsyncFifoSnsPublisher(
             SnsAsyncClient snsClient,
@@ -140,9 +179,11 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
             int bufferSize,
             int partitionBufferSize,
             SnsPublisherMetrics metrics) {
+
         this.snsClient = Objects.requireNonNull(snsClient, "snsClient cannot be null");
         this.topicArn = Objects.requireNonNull(topicArn, "topicArn cannot be null");
         this.batchTimeout = Objects.requireNonNull(batchTimeout, "batchTimeout cannot be null");
+
         if (!SNS_FIFO_ARN_PATTERN.matcher(topicArn).matches()) {
             throw new IllegalArgumentException(
                     "Invalid SNS FIFO topic ARN format. Expected: arn:aws:sns:<region>:<account-id>:<topic-name>.fifo");
@@ -156,20 +197,23 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         if (partitionBufferSize <= 0) {
             throw new IllegalArgumentException("partitionBufferSize must be positive");
         }
+
         this.partitionCount = partitionCount;
         this.bufferSize = bufferSize;
         this.partitionBufferSize = partitionBufferSize;
         this.metrics = metrics;
+
         // Thread pool sized for I/O-bound work (network calls to SNS spend most time waiting)
         // Using 8x CPU cores provides good parallelism while threads wait on network I/O
         int threadPoolSize = Math.min(partitionCount, Runtime.getRuntime().availableProcessors() * 8);
         // Queue cap prevents unbounded memory growth; sized to match upstream buffers
         int queueCap = bufferSize;
-        this.ioScheduler = Schedulers.newBoundedElastic(
-                threadPoolSize,
-                queueCap,
-                "sns-publisher-io");
+        this.ioScheduler = Schedulers.newBoundedElastic(threadPoolSize, queueCap, "sns-publisher-io");
     }
+
+    // ==========================================================================
+    // Public API
+    // ==========================================================================
 
     /**
      * Publishes a stream of events to the SNS FIFO topic.
@@ -202,10 +246,6 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * and the internal buffer is exhausted, an error is emitted. This fail-fast behavior
      * preserves FIFO ordering guarantees by preventing silent data loss.</p>
      *
-     * <p><b>Throttling:</b> AWS SDK automatically handles throttling with retries.
-     * If you hit SNS rate limits consistently, consider reducing partition count
-     * or implementing application-level rate limiting upstream.</p>
-     *
      * @param eventStream the stream of events to publish (must not be null)
      * @return a Flux emitting {@link PublishBatchResponse} for each successfully
      *         published batch; errors are signaled through the Flux's error channel
@@ -214,44 +254,49 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     public Flux<PublishBatchResponse> publishEvents(Flux<SnsEvent> eventStream) {
         return eventStream
                 .onBackpressureBuffer(bufferSize, BufferOverflowStrategy.ERROR)
-                .groupBy(event -> (event.messageGroupId().hashCode() & Integer.MAX_VALUE) % partitionCount)
-                .flatMap(partitionFlux -> partitionFlux
-                        .publishOn(ioScheduler)
-                        .transform(this::bufferByBatchSizeAndPayload)
-                        .onBackpressureBuffer(partitionBufferSize)
-                        .concatMap(this::publishBatchWithMetrics),
-                partitionCount, 1);  // prefetch=1 for tighter backpressure
+                .groupBy(this::computePartitionId)
+                .flatMap(this::processPartition, partitionCount, 1);
     }
 
-    private Mono<PublishBatchResponse> publishBatchWithMetrics(List<SnsEvent> batch) {
-        if (metrics == null) {
-            return publishBatch(batch);
-        }
+    // ==========================================================================
+    // Reactive Pipeline Stages (in execution order)
+    // ==========================================================================
 
-        final long startTime = System.nanoTime();
-        final int batchSize = batch.size();
-        metrics.incrementActiveRequests();
-
-        return publishBatch(batch)
-                .doOnSuccess(response -> {
-                    long latencyNanos = System.nanoTime() - startTime;
-                    int successCount = response.successful() != null ? response.successful().size() : 0;
-                    int failCount = response.failed() != null ? response.failed().size() : 0;
-                    metrics.recordBatchSuccess(successCount, latencyNanos);
-                    if (failCount > 0) {
-                        metrics.recordPartialFailure(failCount);
-                    }
-                })
-                .doOnError(e -> metrics.recordBatchFailure(batchSize))
-                .doFinally(signal -> metrics.decrementActiveRequests());
+    /**
+     * Computes the partition ID for a message group to ensure FIFO ordering.
+     * Uses positive hash to avoid negative modulo results.
+     */
+    private int computePartitionId(SnsEvent event) {
+        return (event.messageGroupId().hashCode() & Integer.MAX_VALUE) % partitionCount;
     }
 
-    private Flux<List<SnsEvent>> bufferByBatchSizeAndPayload(Flux<SnsEvent> input) {
-        return input.bufferTimeout(MAX_BATCH_SIZE, batchTimeout)
-                .flatMapIterable(this::splitBatchByPayloadSize, 1);  // prefetch=1
+    /**
+     * Processes a single partition's event stream: schedules on I/O thread,
+     * batches events, and publishes sequentially to maintain FIFO order.
+     */
+    private Flux<PublishBatchResponse> processPartition(Flux<SnsEvent> partitionFlux) {
+        return partitionFlux
+                .publishOn(ioScheduler)
+                .transform(this::bufferIntoBatches)
+                .onBackpressureBuffer(partitionBufferSize)
+                .concatMap(this::publishBatchWithMetrics);
     }
 
-    private List<List<SnsEvent>> splitBatchByPayloadSize(List<SnsEvent> batch) {
+    /**
+     * Buffers events into batches by size (max 10) and timeout, then splits
+     * any batches that exceed the 256KB payload limit.
+     */
+    private Flux<List<SnsEvent>> bufferIntoBatches(Flux<SnsEvent> input) {
+        return input
+                .bufferTimeout(MAX_BATCH_SIZE, batchTimeout)
+                .flatMapIterable(this::splitByPayloadSize, 1);
+    }
+
+    /**
+     * Splits a batch into smaller sub-batches if the total payload exceeds 256KB.
+     * Ensures each sub-batch stays within SNS payload limits.
+     */
+    private List<List<SnsEvent>> splitByPayloadSize(List<SnsEvent> batch) {
         List<List<SnsEvent>> result = new ArrayList<>();
         List<SnsEvent> currentSubBatch = new ArrayList<>();
         int currentSize = 0;
@@ -259,9 +304,8 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         for (SnsEvent event : batch) {
             int eventSize = estimateUtf8Size(event.payload());
 
-            // If adding this event exceeds limit, seal the current sub-batch
-            // Also ensure we don't split if the sub-batch is empty (single large event case
-            // must fail downstream or be handled otherwise)
+            // Seal current sub-batch if adding this event would exceed limit
+            // (but allow single oversized events to pass through for downstream handling)
             if (!currentSubBatch.isEmpty() && (currentSize + eventSize > MAX_PAYLOAD_SIZE_BYTES)) {
                 result.add(currentSubBatch);
                 currentSubBatch = new ArrayList<>();
@@ -279,76 +323,138 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         return result;
     }
 
+    /**
+     * Wraps batch publishing with metrics collection (if metrics are enabled).
+     */
+    private Mono<PublishBatchResponse> publishBatchWithMetrics(List<SnsEvent> batch) {
+        if (metrics == null) {
+            return publishBatch(batch);
+        }
+
+        final long startTime = System.nanoTime();
+        final int batchSize = batch.size();
+        metrics.incrementActiveRequests();
+
+        return publishBatch(batch)
+                .doOnSuccess(response -> recordSuccessMetrics(response, startTime))
+                .doOnError(e -> metrics.recordBatchFailure(batchSize))
+                .doFinally(signal -> metrics.decrementActiveRequests());
+    }
+
+    private void recordSuccessMetrics(PublishBatchResponse response, long startTime) {
+        long latencyNanos = System.nanoTime() - startTime;
+        int successCount = response.successful() != null ? response.successful().size() : 0;
+        int failCount = response.failed() != null ? response.failed().size() : 0;
+        metrics.recordBatchSuccess(successCount, latencyNanos);
+        if (failCount > 0) {
+            metrics.recordPartialFailure(failCount);
+        }
+    }
+
+    // ==========================================================================
+    // Batch Publishing
+    // ==========================================================================
+
+    /**
+     * Publishes a batch of events to SNS with retry logic for transient failures.
+     */
     private Mono<PublishBatchResponse> publishBatch(List<SnsEvent> batch) {
         if (batch.isEmpty()) {
             return Mono.empty();
         }
 
+        PublishBatchRequest request = buildBatchRequest(batch);
+
+        return Mono.fromFuture(() -> snsClient.publishBatch(request))
+                .retryWhen(createRetrySpec())
+                .flatMap(response -> handleBatchResponse(response, batch.size()))
+                .doOnError(e -> log.error("Failed to publish batch after retries: {}",
+                        sanitizeForLog(e.getMessage())));
+    }
+
+    /**
+     * Builds the SNS PublishBatchRequest from a list of events.
+     */
+    private PublishBatchRequest buildBatchRequest(List<SnsEvent> batch) {
         List<PublishBatchRequestEntry> entries = new ArrayList<>(batch.size());
+
         for (int i = 0; i < batch.size(); i++) {
             SnsEvent event = batch.get(i);
             entries.add(PublishBatchRequestEntry.builder()
-                    .id(event.messageDeduplicationId() + "-" + i)  // Unique ID per batch entry
+                    .id(event.messageDeduplicationId() + "-" + i)
                     .messageGroupId(event.messageGroupId())
                     .message(event.payload())
                     .messageDeduplicationId(event.messageDeduplicationId())
                     .build());
         }
 
-        PublishBatchRequest request = PublishBatchRequest.builder()
+        return PublishBatchRequest.builder()
                 .topicArn(topicArn)
                 .publishBatchRequestEntries(entries)
                 .build();
-
-        return Mono.fromFuture(() -> snsClient.publishBatch(request))
-                .retryWhen(Retry.backoff(3, Duration.ofMillis(100))
-                        .maxBackoff(Duration.ofSeconds(5))
-                        .jitter(0.5)
-                        .filter(this::isRetryableException)
-                        .doBeforeRetry(signal ->
-                            log.warn("Retrying batch publication (attempt {}): {}",
-                                signal.totalRetries() + 1,
-                                sanitizeForLog(signal.failure().getMessage()))))
-                .flatMap(response -> {
-                    if (response.failed() != null && !response.failed().isEmpty()) {
-                        int successCount = response.successful() != null ? response.successful().size() : 0;
-                        log.error("Batch had {} failures out of {} messages. Failed IDs: {}",
-                                response.failed().size(),
-                                batch.size(),
-                                sanitizeForLog(response.failed().stream()
-                                    .map(e -> e.id())
-                                    .collect(Collectors.joining(", "))));
-                        List<FailedEntry> failedEntries = response.failed().stream()
-                                .map(e -> new FailedEntry(e.id(), e.code(), e.message(), e.senderFault()))
-                                .toList();
-                        return Mono.error(new PartialBatchFailureException(failedEntries, successCount));
-                    }
-                    log.debug("Successfully published batch of {} events.", batch.size());
-                    return Mono.just(response);
-                })
-                .doOnError(e -> log.error("Failed to publish batch after retries: {}",
-                        sanitizeForLog(e.getMessage())));
     }
 
     /**
-     * Determines if an exception is retryable (transient error).
-     *
-     * @param throwable the exception to check
-     * @return true if the exception should be retried
+     * Handles the SNS batch response, converting partial failures to errors.
      */
-    private boolean isRetryableException(Throwable throwable) {
-        // Check for AWS SNS-specific retryable errors
-        if (throwable instanceof SnsException snsEx) {
-            String errorCode = snsEx.awsErrorDetails() != null ?
-                snsEx.awsErrorDetails().errorCode() : "";
-            return "Throttling".equals(errorCode) ||
-                   "InternalError".equals(errorCode) ||
-                   "ServiceUnavailable".equals(errorCode);
+    private Mono<PublishBatchResponse> handleBatchResponse(PublishBatchResponse response, int batchSize) {
+        if (response.failed() == null || response.failed().isEmpty()) {
+            log.debug("Successfully published batch of {} events.", batchSize);
+            return Mono.just(response);
         }
 
-        // Check the exception and its cause for network/IO errors
-        Throwable cause = throwable.getCause();
-        return isNetworkException(throwable) || (cause != null && isNetworkException(cause));
+        int successCount = response.successful() != null ? response.successful().size() : 0;
+        log.error("Batch had {} failures out of {} messages. Failed IDs: {}",
+                response.failed().size(),
+                batchSize,
+                sanitizeForLog(response.failed().stream()
+                        .map(e -> e.id())
+                        .collect(Collectors.joining(", "))));
+
+        List<FailedEntry> failedEntries = response.failed().stream()
+                .map(e -> new FailedEntry(e.id(), e.code(), e.message(), e.senderFault()))
+                .toList();
+
+        return Mono.error(new PartialBatchFailureException(failedEntries, successCount));
+    }
+
+    /**
+     * Creates the retry specification for transient failure handling.
+     */
+    private Retry createRetrySpec() {
+        return Retry.backoff(MAX_RETRIES, RETRY_MIN_BACKOFF)
+                .maxBackoff(RETRY_MAX_BACKOFF)
+                .jitter(RETRY_JITTER)
+                .filter(this::isRetryableException)
+                .doBeforeRetry(signal ->
+                        log.warn("Retrying batch publication (attempt {}): {}",
+                                signal.totalRetries() + 1,
+                                sanitizeForLog(signal.failure().getMessage())));
+    }
+
+    // ==========================================================================
+    // Error Handling
+    // ==========================================================================
+
+    /**
+     * Determines if an exception is retryable (transient error).
+     */
+    private boolean isRetryableException(Throwable throwable) {
+        if (throwable instanceof SnsException snsEx) {
+            return isRetryableSnsError(snsEx);
+        }
+        return isNetworkException(throwable) ||
+                (throwable.getCause() != null && isNetworkException(throwable.getCause()));
+    }
+
+    /**
+     * Checks if an SNS exception indicates a retryable error.
+     */
+    private boolean isRetryableSnsError(SnsException snsEx) {
+        if (snsEx.awsErrorDetails() == null) {
+            return false;
+        }
+        return RETRYABLE_ERROR_CODES.contains(snsEx.awsErrorDetails().errorCode());
     }
 
     /**
@@ -356,9 +462,13 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      */
     private boolean isNetworkException(Throwable t) {
         return t instanceof SocketTimeoutException ||
-               t instanceof IOException ||
-               t instanceof SSLException;
+                t instanceof IOException ||
+                t instanceof SSLException;
     }
+
+    // ==========================================================================
+    // Utilities
+    // ==========================================================================
 
     /**
      * Estimates UTF-8 encoded size without allocating a byte array.
@@ -393,6 +503,10 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         }
         return LOG_SANITIZE_PATTERN.matcher(input).replaceAll("_");
     }
+
+    // ==========================================================================
+    // Lifecycle
+    // ==========================================================================
 
     /**
      * Disposes of the internal scheduler when the Spring context is destroyed.

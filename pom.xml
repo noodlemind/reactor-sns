@@ -22,6 +22,15 @@
     <developerConnection>scm:git:ssh://github.com:noodlemind/reactor-sns.git</developerConnection>
     <url>https://github.com/noodlemind/reactor-sns</url>
   </scm>
+
+  <developers>
+    <developer>
+      <id>clype</id>
+      <name>Clype</name>
+      <organization>Clype</organization>
+      <organizationUrl>https://github.com/noodlemind</organizationUrl>
+    </developer>
+  </developers>
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -192,4 +201,44 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+              <groupId>org.apache.maven.plugins</groupId>
+              <artifactId>maven-gpg-plugin</artifactId>
+              <version>3.2.4</version>
+              <executions>
+                  <execution>
+                      <id>sign-artifacts</id>
+                      <phase>verify</phase>
+                      <goals>
+                          <goal>sign</goal>
+                      </goals>
+                      <configuration>
+                          <gpgArguments>
+                              <arg>--pinentry-mode</arg>
+                              <arg>loopback</arg>
+                          </gpgArguments>
+                      </configuration>
+                  </execution>
+              </executions>
+          </plugin>
+          <plugin>
+              <groupId>org.sonatype.central</groupId>
+              <artifactId>central-publishing-maven-plugin</artifactId>
+              <version>0.9.0</version>
+              <extensions>true</extensions>
+              <configuration>
+                  <publishingServerId>central</publishingServerId>
+                  <tokenAuth>true</tokenAuth>
+              </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

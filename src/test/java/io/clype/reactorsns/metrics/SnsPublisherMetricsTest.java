@@ -94,16 +94,6 @@ class SnsPublisherMetricsTest {
     }
 
     @Test
-    void shouldExtractTopicNameFromArn() {
-        // Already tested implicitly - metrics are tagged with "MyTopic.fifo"
-        assertEquals(1.0, registry.counter("sns.publisher.batches.completed", "topic", "MyTopic.fifo").count()
-                + registry.counter("sns.publisher.batches.failed", "topic", "MyTopic.fifo").count()
-                - registry.counter("sns.publisher.batches.completed", "topic", "MyTopic.fifo").count()
-                - registry.counter("sns.publisher.batches.failed", "topic", "MyTopic.fifo").count()
-                + 1);
-    }
-
-    @Test
     void shouldHandleNullTopicArn() {
         var metricsWithNullArn = new SnsPublisherMetrics(registry, null);
         metricsWithNullArn.recordBatchSuccess(5, 1_000_000L);
