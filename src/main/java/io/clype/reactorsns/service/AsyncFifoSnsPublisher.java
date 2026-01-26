@@ -2,11 +2,11 @@ package io.clype.reactorsns.service;
 
 import java.io.IOException;
 import java.net.SocketTimeoutException;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import javax.net.ssl.SSLException;
@@ -16,8 +16,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
 
 import io.clype.reactorsns.metrics.SnsPublisherMetrics;
+import io.clype.reactorsns.model.FailedEntry;
 import io.clype.reactorsns.model.PartialBatchFailureException;
-import io.clype.reactorsns.model.PublisherStatus;
 import io.clype.reactorsns.model.SnsEvent;
 
 import reactor.core.publisher.BufferOverflowStrategy;
@@ -88,6 +88,13 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     /** SNS FIFO maximum payload size per batch: 256 KB (AWS hard limit). */
     public static final int MAX_PAYLOAD_SIZE_BYTES = 256 * 1024;
 
+    /** Pattern for validating SNS FIFO topic ARNs (supports all AWS partitions). */
+    private static final Pattern SNS_FIFO_ARN_PATTERN = Pattern.compile(
+            "^arn:aws(-[a-z-]+)?:sns:[a-z0-9-]+:\\d{12}:[a-zA-Z0-9._-]+\\.fifo$");
+
+    /** Pattern for sanitizing log output - removes all control characters. */
+    private static final Pattern LOG_SANITIZE_PATTERN = Pattern.compile("[\\p{Cntrl}\\p{Cc}]");
+
     private final int partitionCount;
     private final Duration batchTimeout;
     private final SnsAsyncClient snsClient;
@@ -136,8 +143,9 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         this.snsClient = Objects.requireNonNull(snsClient, "snsClient cannot be null");
         this.topicArn = Objects.requireNonNull(topicArn, "topicArn cannot be null");
         this.batchTimeout = Objects.requireNonNull(batchTimeout, "batchTimeout cannot be null");
-        if (!topicArn.endsWith(".fifo")) {
-            throw new IllegalArgumentException("topicArn must end with .fifo for FIFO topics");
+        if (!SNS_FIFO_ARN_PATTERN.matcher(topicArn).matches()) {
+            throw new IllegalArgumentException(
+                    "Invalid SNS FIFO topic ARN format. Expected: arn:aws:sns:<region>:<account-id>:<topic-name>.fifo");
         }
         if (partitionCount <= 0) {
             throw new IllegalArgumentException("partitionCount must be positive");
@@ -152,11 +160,14 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         this.bufferSize = bufferSize;
         this.partitionBufferSize = partitionBufferSize;
         this.metrics = metrics;
-        // Thread pool sized for I/O-bound work: min of partition count or 4x CPU cores
-        int threadPoolSize = Math.min(partitionCount, Runtime.getRuntime().availableProcessors() * 4);
+        // Thread pool sized for I/O-bound work (network calls to SNS spend most time waiting)
+        // Using 8x CPU cores provides good parallelism while threads wait on network I/O
+        int threadPoolSize = Math.min(partitionCount, Runtime.getRuntime().availableProcessors() * 8);
+        // Queue cap prevents unbounded memory growth; sized to match upstream buffers
+        int queueCap = bufferSize;
         this.ioScheduler = Schedulers.newBoundedElastic(
                 threadPoolSize,
-                Integer.MAX_VALUE,
+                queueCap,
                 "sns-publisher-io");
     }
 
@@ -246,7 +257,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         int currentSize = 0;
 
         for (SnsEvent event : batch) {
-            int eventSize = event.payload() != null ? event.payload().getBytes(StandardCharsets.UTF_8).length : 0;
+            int eventSize = estimateUtf8Size(event.payload());
 
             // If adding this event exceeds limit, seal the current sub-batch
             // Also ensure we don't split if the sub-batch is empty (single large event case
@@ -307,7 +318,10 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
                                 sanitizeForLog(response.failed().stream()
                                     .map(e -> e.id())
                                     .collect(Collectors.joining(", "))));
-                        return Mono.error(new PartialBatchFailureException(response.failed(), successCount));
+                        List<FailedEntry> failedEntries = response.failed().stream()
+                                .map(e -> new FailedEntry(e.id(), e.code(), e.message(), e.senderFault()))
+                                .toList();
+                        return Mono.error(new PartialBatchFailureException(failedEntries, successCount));
                     }
                     log.debug("Successfully published batch of {} events.", batch.size());
                     return Mono.just(response);
@@ -343,30 +357,41 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     private boolean isNetworkException(Throwable t) {
         return t instanceof SocketTimeoutException ||
                t instanceof IOException ||
-               t instanceof SSLException ||
-               t.getClass().getName().equals("io.netty.handler.timeout.ReadTimeoutException") ||
-               t.getClass().getName().equals("io.netty.handler.timeout.WriteTimeoutException");
+               t instanceof SSLException;
     }
 
     /**
-     * Sanitizes a string for safe logging by removing control characters.
-     * Prevents log injection attacks.
+     * Estimates UTF-8 encoded size without allocating a byte array.
+     * For ASCII strings (common in JSON payloads), this is exact.
+     * For non-ASCII, this provides a safe upper bound.
+     */
+    private int estimateUtf8Size(String str) {
+        if (str == null) {
+            return 0;
+        }
+        int size = 0;
+        for (int i = 0; i < str.length(); i++) {
+            char c = str.charAt(i);
+            if (c < 0x80) {
+                size += 1;  // ASCII: 1 byte
+            } else if (c < 0x800) {
+                size += 2;  // 2-byte UTF-8
+            } else {
+                size += 3;  // 3-byte UTF-8 (covers BMP, surrogate pairs handled implicitly)
+            }
+        }
+        return size;
+    }
+
+    /**
+     * Sanitizes a string for safe logging by removing all control characters.
+     * Prevents log injection attacks including ANSI escape sequences.
      */
     private String sanitizeForLog(String input) {
         if (input == null) {
             return "null";
         }
-        return input.replaceAll("[\r\n\t]", "_");
-    }
-
-    /**
-     * Returns the current status of the publisher for monitoring and introspection.
-     *
-     * @return a status object with active requests, partition count, and buffer size
-     */
-    public PublisherStatus getStatus() {
-        int activeRequests = metrics != null ? metrics.getActiveRequests() : 0;
-        return new PublisherStatus(activeRequests, partitionCount, bufferSize);
+        return LOG_SANITIZE_PATTERN.matcher(input).replaceAll("_");
     }
 
     /**

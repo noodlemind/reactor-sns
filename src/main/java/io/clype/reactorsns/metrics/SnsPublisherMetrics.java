@@ -138,51 +138,6 @@ public class SnsPublisherMetrics {
     }
 
     /**
-     * Returns the number of batches successfully completed.
-     *
-     * @return count of completed batches
-     */
-    public long getBatchesCompleted() {
-        return (long) batchesCompleted.count();
-    }
-
-    /**
-     * Returns the number of batches that failed completely.
-     *
-     * @return count of failed batches
-     */
-    public long getBatchesFailed() {
-        return (long) batchesFailed.count();
-    }
-
-    /**
-     * Returns the total number of events successfully published.
-     *
-     * @return count of published events
-     */
-    public long getEventsPublished() {
-        return (long) eventsPublished.count();
-    }
-
-    /**
-     * Returns the total number of events that failed to publish.
-     *
-     * @return count of failed events
-     */
-    public long getEventsFailed() {
-        return (long) eventsFailed.count();
-    }
-
-    /**
-     * Returns the current number of in-flight publish requests.
-     *
-     * @return count of active requests
-     */
-    public int getActiveRequests() {
-        return activeRequests.get();
-    }
-
-    /**
      * Extracts the topic name from an ARN.
      *
      * @param topicArn the full ARN (e.g., arn:aws:sns:us-east-1:123456789012:MyTopic.fifo)

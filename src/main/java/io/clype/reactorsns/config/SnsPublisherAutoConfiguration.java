@@ -32,6 +32,7 @@ import software.amazon.awssdk.services.sns.SnsAsyncClient;
  *     region: us-east-1        # Optional, uses default provider chain if not set
  *     partition-count: 256     # Optional, default: 256
  *     batch-timeout: 10ms      # Optional, default: 10ms
+ *     max-connections: 100     # Optional, default: 100
  * }</pre>
  *
  * <p><b>Bean Customization:</b> All beans created by this configuration use
@@ -76,7 +77,7 @@ public class SnsPublisherAutoConfiguration {
     @ConditionalOnMissingBean
     public SdkAsyncHttpClient awsCrtHttpClient() {
         return AwsCrtAsyncHttpClient.builder()
-                .maxConcurrency(Math.max(500, properties.getPartitionCount() * 2))
+                .maxConcurrency(properties.getMaxConnections())
                 .connectionTimeout(Duration.ofSeconds(10))
                 .connectionMaxIdleTime(Duration.ofSeconds(60))
                 .build();

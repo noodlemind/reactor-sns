@@ -1,8 +1,7 @@
 package io.clype.reactorsns.model;
 
 import java.util.List;
-
-import software.amazon.awssdk.services.sns.model.BatchResultErrorEntry;
+import java.util.Objects;
 
 /**
  * Exception thrown when some messages in a batch fail to publish.
@@ -12,18 +11,19 @@ import software.amazon.awssdk.services.sns.model.BatchResultErrorEntry;
  */
 public class PartialBatchFailureException extends RuntimeException {
 
-    private final List<BatchResultErrorEntry> failedEntries;
+    private final List<FailedEntry> failedEntries;
     private final int successCount;
     private final int failureCount;
 
     /**
      * Creates a new PartialBatchFailureException.
      *
-     * @param failedEntries the list of failed batch entries from AWS
+     * @param failedEntries the list of failed entries
      * @param successCount  the number of messages that succeeded
      */
-    public PartialBatchFailureException(List<BatchResultErrorEntry> failedEntries, int successCount) {
-        super("Partial batch failure: " + failedEntries.size() + " of " +
+    public PartialBatchFailureException(List<FailedEntry> failedEntries, int successCount) {
+        super("Partial batch failure: " +
+              Objects.requireNonNull(failedEntries, "failedEntries cannot be null").size() + " of " +
               (failedEntries.size() + successCount) + " messages failed");
         this.failedEntries = List.copyOf(failedEntries);
         this.successCount = successCount;
@@ -35,7 +35,7 @@ public class PartialBatchFailureException extends RuntimeException {
      *
      * @return immutable list of failed entries
      */
-    public List<BatchResultErrorEntry> getFailedEntries() {
+    public List<FailedEntry> getFailedEntries() {
         return failedEntries;
     }
 
