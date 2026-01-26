@@ -2,6 +2,7 @@ package io.clype.reactorsns.config;
 
 import java.time.Duration;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -9,6 +10,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 
+import io.clype.reactorsns.metrics.SnsPublisherMetrics;
 import io.clype.reactorsns.service.AsyncFifoSnsPublisher;
 
 import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
@@ -30,6 +32,7 @@ import software.amazon.awssdk.services.sns.SnsAsyncClient;
  *     region: us-east-1        # Optional, uses default provider chain if not set
  *     partition-count: 256     # Optional, default: 256
  *     batch-timeout: 10ms      # Optional, default: 10ms
+ *     max-connections: 100     # Optional, default: 100
  * }</pre>
  *
  * <p><b>Bean Customization:</b> All beans created by this configuration use
@@ -74,7 +77,7 @@ public class SnsPublisherAutoConfiguration {
     @ConditionalOnMissingBean
     public SdkAsyncHttpClient awsCrtHttpClient() {
         return AwsCrtAsyncHttpClient.builder()
-                .maxConcurrency(Math.max(500, properties.getPartitionCount() * 2))
+                .maxConcurrency(properties.getMaxConnections())
                 .connectionTimeout(Duration.ofSeconds(10))
                 .connectionMaxIdleTime(Duration.ofSeconds(60))
                 .build();
@@ -105,20 +108,29 @@ public class SnsPublisherAutoConfiguration {
     /**
      * Creates the async FIFO SNS publisher bean.
      *
-     * <p>The publisher is configured with the topic ARN, partition count, and batch timeout
-     * from the application properties.</p>
+     * <p>The publisher is configured with the topic ARN, partition count, batch timeout,
+     * backpressure settings, rate limiting, and optional metrics from the application
+     * properties.</p>
      *
      * @param snsClient the SNS async client to use for publishing
+     * @param metrics   optional metrics collector (may be null if metrics are disabled)
      * @return the configured publisher instance
      */
     @Bean
     @ConditionalOnMissingBean
     @ConditionalOnBean(SnsAsyncClient.class)
-    public AsyncFifoSnsPublisher asyncFifoSnsPublisher(SnsAsyncClient snsClient) {
+    public AsyncFifoSnsPublisher asyncFifoSnsPublisher(
+            SnsAsyncClient snsClient,
+            @Autowired(required = false) SnsPublisherMetrics metrics) {
+        var bp = properties.getBackpressure();
+
         return new AsyncFifoSnsPublisher(
                 snsClient,
                 properties.getTopicArn(),
                 properties.getPartitionCount(),
-                properties.getBatchTimeout());
+                properties.getBatchTimeout(),
+                bp.getBufferSize(),
+                bp.getPartitionBufferSize(),
+                metrics);
     }
 }

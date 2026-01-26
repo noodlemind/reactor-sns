@@ -1,1 +1,2 @@
 io.clype.reactorsns.config.SnsPublisherAutoConfiguration
+io.clype.reactorsns.config.SnsPublisherMetricsAutoConfiguration

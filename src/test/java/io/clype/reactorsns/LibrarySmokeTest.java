@@ -7,8 +7,11 @@ import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
 import io.clype.reactorsns.config.SnsPublisherAutoConfiguration;
+import io.clype.reactorsns.config.SnsPublisherMetricsAutoConfiguration;
 import io.clype.reactorsns.config.SnsPublisherProperties;
+import io.clype.reactorsns.metrics.SnsPublisherMetrics;
 import io.clype.reactorsns.service.AsyncFifoSnsPublisher;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
 
@@ -54,6 +57,68 @@ class LibrarySmokeTest {
                     SnsPublisherProperties properties = context.getBean(SnsPublisherProperties.class);
                     assertThat(properties.getPartitionCount()).isEqualTo(10);
                     assertThat(properties.getBatchTimeout()).isEqualTo(Duration.ofMillis(50));
+                });
+    }
+
+    @Test
+    void testBackpressureProperties() {
+        contextRunner
+                .withPropertyValues(
+                        "sns.publisher.topic-arn=arn:aws:sns:us-east-1:123456789012:MyTopic.fifo",
+                        "sns.publisher.backpressure.buffer-size=50000",
+                        "sns.publisher.backpressure.partition-buffer-size=500")
+                .run(context -> {
+                    SnsPublisherProperties properties = context.getBean(SnsPublisherProperties.class);
+                    assertThat(properties.getBackpressure().getBufferSize()).isEqualTo(50000);
+                    assertThat(properties.getBackpressure().getPartitionBufferSize()).isEqualTo(500);
+                });
+    }
+
+    @Test
+    void testMetricsAutoConfigurationWithMeterRegistry() {
+        contextRunner
+                .withConfiguration(AutoConfigurations.of(SnsPublisherMetricsAutoConfiguration.class))
+                .withBean(SimpleMeterRegistry.class, SimpleMeterRegistry::new)
+                .withPropertyValues("sns.publisher.topic-arn=arn:aws:sns:us-east-1:123456789012:MyTopic.fifo")
+                .run(context -> {
+                    assertThat(context).hasSingleBean(SnsPublisherMetrics.class);
+                });
+    }
+
+    @Test
+    void testMetricsDisabledWhenPropertyFalse() {
+        contextRunner
+                .withConfiguration(AutoConfigurations.of(SnsPublisherMetricsAutoConfiguration.class))
+                .withBean(SimpleMeterRegistry.class, SimpleMeterRegistry::new)
+                .withPropertyValues(
+                        "sns.publisher.topic-arn=arn:aws:sns:us-east-1:123456789012:MyTopic.fifo",
+                        "sns.publisher.metrics.enabled=false")
+                .run(context -> {
+                    assertThat(context).doesNotHaveBean(SnsPublisherMetrics.class);
+                });
+    }
+
+    @Test
+    void testMetricsNotCreatedWithoutMeterRegistry() {
+        contextRunner
+                .withConfiguration(AutoConfigurations.of(SnsPublisherMetricsAutoConfiguration.class))
+                .withPropertyValues("sns.publisher.topic-arn=arn:aws:sns:us-east-1:123456789012:MyTopic.fifo")
+                .run(context -> {
+                    assertThat(context).doesNotHaveBean(SnsPublisherMetrics.class);
+                });
+    }
+
+    @Test
+    void testDefaultBackpressureProperties() {
+        contextRunner
+                .withPropertyValues("sns.publisher.topic-arn=arn:aws:sns:us-east-1:123456789012:MyTopic.fifo")
+                .run(context -> {
+                    SnsPublisherProperties properties = context.getBean(SnsPublisherProperties.class);
+                    // Default backpressure values (reduced for memory efficiency)
+                    assertThat(properties.getBackpressure().getBufferSize()).isEqualTo(10_000);
+                    assertThat(properties.getBackpressure().getPartitionBufferSize()).isEqualTo(100);
+                    // Default metrics enabled
+                    assertThat(properties.getMetrics().isEnabled()).isTrue();
                 });
     }
 }

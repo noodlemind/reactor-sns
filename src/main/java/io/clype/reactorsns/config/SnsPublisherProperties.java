@@ -18,6 +18,12 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *     region: us-east-1
  *     partition-count: 256
  *     batch-timeout: 10ms
+ *     max-connections: 100
+ *     metrics:
+ *       enabled: true
+ *     backpressure:
+ *       buffer-size: 10000
+ *       partition-buffer-size: 100
  * }</pre>
  *
  * @see SnsPublisherAutoConfiguration
@@ -25,104 +31,52 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "sns.publisher")
 public class SnsPublisherProperties {
 
-    /**
-     * The ARN of the SNS topic to publish to.
-     */
     private String topicArn;
-
-    /**
-     * AWS Region for the SNS client.
-     * Default: null (Uses AWS Default Region Provider Chain)
-     */
     private String region;
-
-    /**
-     * Number of logical partitions to ensure FIFO ordering.
-     * Default: 256
-     */
     private int partitionCount = 256;
-
-    /**
-     * Timeout for buffering batch messages before sending.
-     * Default: 10ms
-     */
     private Duration batchTimeout = Duration.ofMillis(10);
+    private int maxConnections = 100;
+    private MetricsConfig metrics = new MetricsConfig();
+    private BackpressureConfig backpressure = new BackpressureConfig();
 
-    /**
-     * Creates a new SnsPublisherProperties with default values.
-     */
-    public SnsPublisherProperties() {
+    public String getTopicArn() { return topicArn; }
+    public void setTopicArn(String topicArn) { this.topicArn = topicArn; }
+
+    public String getRegion() { return region; }
+    public void setRegion(String region) { this.region = region; }
+
+    public int getPartitionCount() { return partitionCount; }
+    public void setPartitionCount(int partitionCount) { this.partitionCount = partitionCount; }
+
+    public Duration getBatchTimeout() { return batchTimeout; }
+    public void setBatchTimeout(Duration batchTimeout) { this.batchTimeout = batchTimeout; }
+
+    public int getMaxConnections() { return maxConnections; }
+    public void setMaxConnections(int maxConnections) { this.maxConnections = maxConnections; }
+
+    public MetricsConfig getMetrics() { return metrics; }
+    public void setMetrics(MetricsConfig metrics) { this.metrics = metrics; }
+
+    public BackpressureConfig getBackpressure() { return backpressure; }
+    public void setBackpressure(BackpressureConfig backpressure) { this.backpressure = backpressure; }
+
+    /** Metrics configuration. */
+    public static class MetricsConfig {
+        private boolean enabled = true;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
     }
 
-    /**
-     * Returns the SNS topic ARN.
-     *
-     * @return the SNS topic ARN
-     */
-    public String getTopicArn() {
-        return topicArn;
-    }
+    /** Backpressure configuration. */
+    public static class BackpressureConfig {
+        private int bufferSize = 10_000;
+        private int partitionBufferSize = 100;
 
-    /**
-     * Sets the SNS topic ARN.
-     *
-     * @param topicArn the SNS topic ARN
-     */
-    public void setTopicArn(String topicArn) {
-        this.topicArn = topicArn;
-    }
+        public int getBufferSize() { return bufferSize; }
+        public void setBufferSize(int bufferSize) { this.bufferSize = bufferSize; }
 
-    /**
-     * Returns the AWS region.
-     *
-     * @return the AWS region
-     */
-    public String getRegion() {
-        return region;
-    }
-
-    /**
-     * Sets the AWS region.
-     *
-     * @param region the AWS region
-     */
-    public void setRegion(String region) {
-        this.region = region;
-    }
-
-    /**
-     * Returns the partition count.
-     *
-     * @return the partition count
-     */
-    public int getPartitionCount() {
-        return partitionCount;
-    }
-
-    /**
-     * Sets the partition count.
-     *
-     * @param partitionCount the partition count
-     */
-    public void setPartitionCount(int partitionCount) {
-        this.partitionCount = partitionCount;
-    }
-
-    /**
-     * Returns the batch timeout.
-     *
-     * @return the batch timeout
-     */
-    public Duration getBatchTimeout() {
-        return batchTimeout;
-    }
-
-    /**
-     * Sets the batch timeout.
-     *
-     * @param batchTimeout the batch timeout
-     */
-    public void setBatchTimeout(Duration batchTimeout) {
-        this.batchTimeout = batchTimeout;
+        public int getPartitionBufferSize() { return partitionBufferSize; }
+        public void setPartitionBufferSize(int partitionBufferSize) { this.partitionBufferSize = partitionBufferSize; }
     }
 }
