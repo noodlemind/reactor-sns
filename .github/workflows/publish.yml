@@ -44,10 +44,11 @@ jobs:
           distribution: 'temurin'
           cache: maven
           server-id: github
-          server-username: ${{ github.actor }}
-          server-password: ${{ secrets.GITHUB_TOKEN }}
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
 
       - name: Publish to GitHub Packages
         run: mvn deploy -B -DskipTests -DaltDeploymentRepository=github::https://maven.pkg.github.com/noodlemind/reactor-sns
         env:
+          GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
