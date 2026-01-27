@@ -19,8 +19,6 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *     partition-count: 256
  *     batch-timeout: 10ms
  *     max-connections: 100
- *     api-call-timeout: 30s
- *     api-call-attempt-timeout: 10s
  *     metrics:
  *       enabled: true
  *     backpressure:
@@ -38,8 +36,6 @@ public class SnsPublisherProperties {
     private int partitionCount = 256;
     private Duration batchTimeout = Duration.ofMillis(10);
     private int maxConnections = 100;
-    private Duration apiCallTimeout = Duration.ofSeconds(30);
-    private Duration apiCallAttemptTimeout = Duration.ofSeconds(10);
     private MetricsConfig metrics = new MetricsConfig();
     private BackpressureConfig backpressure = new BackpressureConfig();
 
@@ -57,12 +53,6 @@ public class SnsPublisherProperties {
 
     public int getMaxConnections() { return maxConnections; }
     public void setMaxConnections(int maxConnections) { this.maxConnections = maxConnections; }
-
-    public Duration getApiCallTimeout() { return apiCallTimeout; }
-    public void setApiCallTimeout(Duration apiCallTimeout) { this.apiCallTimeout = apiCallTimeout; }
-
-    public Duration getApiCallAttemptTimeout() { return apiCallAttemptTimeout; }
-    public void setApiCallAttemptTimeout(Duration apiCallAttemptTimeout) { this.apiCallAttemptTimeout = apiCallAttemptTimeout; }
 
     public MetricsConfig getMetrics() { return metrics; }
     public void setMetrics(MetricsConfig metrics) { this.metrics = metrics; }

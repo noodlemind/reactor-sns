@@ -81,7 +81,6 @@ class AsyncFifoSnsPublisherTest {
             }
         }
 
-        System.out.println("Input Stream size: " + inputEvents.size());
         Flux<SnsEvent> eventStream = Flux.fromIterable(inputEvents);
 
         // ACTION: Publish events
@@ -98,7 +97,6 @@ class AsyncFifoSnsPublisherTest {
         verify(snsClient, atLeast(1)).publishBatch(captor.capture());
 
         List<PublishBatchRequest> sentRequests = captor.getAllValues();
-        System.out.println("Total batches sent: " + sentRequests.size());
 
         // Reconstruct the timeline for each group from the batches
         Map<String, List<Integer>> groupSequences = new HashMap<>();
@@ -119,7 +117,6 @@ class AsyncFifoSnsPublisherTest {
         // Assertions
         for (String groupId : groupIds) {
             List<Integer> sequence = groupSequences.get(groupId);
-            System.out.println("Verifying sequence for " + groupId + ": " + sequence);
 
             assertEquals(eventsPerGroup, sequence.size(), "Should have all events for " + groupId);
 

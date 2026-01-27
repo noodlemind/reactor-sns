@@ -103,10 +103,9 @@ public class SnsPublisherAutoConfiguration {
     public SnsAsyncClient snsAsyncClient(SdkAsyncHttpClient httpClient) {
         // Disable SDK retries - we handle retries at the Reactor level to avoid
         // retry amplification (SDK retries × Reactor retries = excessive load)
+        // API timeouts are left to SDK defaults - the SDK manages these appropriately
         ClientOverrideConfiguration overrideConfig = ClientOverrideConfiguration.builder()
                 .retryPolicy(RetryPolicy.none())
-                .apiCallTimeout(properties.getApiCallTimeout())
-                .apiCallAttemptTimeout(properties.getApiCallAttemptTimeout())
                 .build();
 
         var builder = SnsAsyncClient.builder()
@@ -146,6 +145,7 @@ public class SnsPublisherAutoConfiguration {
                 properties.getBatchTimeout(),
                 bp.getBufferSize(),
                 bp.getPartitionBufferSize(),
+                properties.getMaxConnections(),
                 metrics);
     }
 }

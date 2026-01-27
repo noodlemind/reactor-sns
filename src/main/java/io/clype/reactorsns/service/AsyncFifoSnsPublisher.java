@@ -169,6 +169,9 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     // Constructors
     // ==========================================================================
 
+    /** Default HTTP connection pool size when not specified. */
+    private static final int DEFAULT_MAX_CONNECTIONS = 100;
+
     /**
      * Creates a new AsyncFifoSnsPublisher with default buffer sizes and no metrics.
      *
@@ -181,7 +184,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      */
     public AsyncFifoSnsPublisher(SnsAsyncClient snsClient, String topicArn,
                                   int partitionCount, Duration batchTimeout) {
-        this(snsClient, topicArn, partitionCount, batchTimeout, 10_000, 100, null);
+        this(snsClient, topicArn, partitionCount, batchTimeout, 10_000, 100, DEFAULT_MAX_CONNECTIONS, null);
     }
 
     /**
@@ -197,6 +200,35 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * @throws NullPointerException if snsClient, topicArn, or batchTimeout is null
      * @throws IllegalArgumentException if any numeric parameter is not positive
      * @throws IllegalArgumentException if topicArn does not match SNS FIFO ARN format
+     * @deprecated Use the constructor with maxConnections parameter for optimal thread pool sizing
+     */
+    @Deprecated
+    public AsyncFifoSnsPublisher(
+            SnsAsyncClient snsClient,
+            String topicArn,
+            int partitionCount,
+            Duration batchTimeout,
+            int bufferSize,
+            int partitionBufferSize,
+            SnsPublisherMetrics metrics) {
+        this(snsClient, topicArn, partitionCount, batchTimeout, bufferSize, partitionBufferSize,
+                DEFAULT_MAX_CONNECTIONS, metrics);
+    }
+
+    /**
+     * Creates a new AsyncFifoSnsPublisher with full configuration options including connection pool coordination.
+     *
+     * @param snsClient            the AWS SNS async client to use for publishing
+     * @param topicArn             the ARN of the SNS FIFO topic (must end with .fifo)
+     * @param partitionCount       number of logical partitions for parallel processing
+     * @param batchTimeout         maximum time to wait for a batch to fill before sending
+     * @param bufferSize           main buffer size for incoming events (default: 10,000)
+     * @param partitionBufferSize  buffer size per partition for batched events (default: 100)
+     * @param maxConnections       HTTP client connection pool size (used to size thread pool)
+     * @param metrics              optional metrics collector (may be null)
+     * @throws NullPointerException if snsClient, topicArn, or batchTimeout is null
+     * @throws IllegalArgumentException if any numeric parameter is not positive
+     * @throws IllegalArgumentException if topicArn does not match SNS FIFO ARN format
      */
     public AsyncFifoSnsPublisher(
             SnsAsyncClient snsClient,
@@ -205,6 +237,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
             Duration batchTimeout,
             int bufferSize,
             int partitionBufferSize,
+            int maxConnections,
             SnsPublisherMetrics metrics) {
 
         this.snsClient = Objects.requireNonNull(snsClient, "snsClient cannot be null");
@@ -233,15 +266,19 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         if (partitionBufferSize > MAX_PARTITION_BUFFER_SIZE) {
             throw new IllegalArgumentException("partitionBufferSize must not exceed " + MAX_PARTITION_BUFFER_SIZE);
         }
+        if (maxConnections <= 0) {
+            throw new IllegalArgumentException("maxConnections must be positive");
+        }
 
         this.partitionCount = partitionCount;
         this.bufferSize = bufferSize;
         this.partitionBufferSize = partitionBufferSize;
         this.metrics = metrics;
 
-        // Thread pool sized for I/O-bound work (network calls to SNS spend most time waiting)
-        // Using 8x CPU cores provides good parallelism while threads wait on network I/O
-        int threadPoolSize = Math.min(partitionCount, Runtime.getRuntime().availableProcessors() * 8);
+        // Thread pool sized to match connection pool for I/O-bound work.
+        // For network calls that spend most time waiting, threads ≈ connections is optimal.
+        // Cap at partitionCount since we can't utilize more threads than partitions.
+        int threadPoolSize = Math.min(partitionCount, maxConnections);
         // Queue cap prevents unbounded memory growth; sized for all partitions with their buffers
         // Factor of 2 provides headroom for in-flight work during processing
         int queueCap = partitionCount * partitionBufferSize * 2;

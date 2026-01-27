@@ -65,8 +65,6 @@ public class MyService {
 | `sns.publisher.partition-count` | `256` | Parallel processing partitions (max: 4096) |
 | `sns.publisher.batch-timeout` | `10ms` | Max wait time before sending batch |
 | `sns.publisher.max-connections` | `100` | HTTP client connection pool size |
-| `sns.publisher.api-call-timeout` | `30s` | Total timeout for API call including retries |
-| `sns.publisher.api-call-attempt-timeout` | `10s` | Timeout for single API attempt |
 | `sns.publisher.backpressure.buffer-size` | `10000` | Main buffer size (max: 1,000,000) |
 | `sns.publisher.backpressure.partition-buffer-size` | `100` | Per-partition buffer (max: 10,000) |
 
