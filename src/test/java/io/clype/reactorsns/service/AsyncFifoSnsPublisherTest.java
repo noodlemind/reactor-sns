@@ -29,6 +29,7 @@ import software.amazon.awssdk.services.sns.model.PublishBatchResponse;
 import software.amazon.awssdk.services.sns.model.PublishBatchResultEntry;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
@@ -564,5 +565,41 @@ class AsyncFifoSnsPublisherTest {
         // All three groups should have been attempted (processed in parallel)
         assertEquals(3, callCount.get(),
             "All three groups (A, B, C) should be attempted independently");
+    }
+
+    // ==========================================================================
+    // Configuration Validation Tests
+    // ==========================================================================
+
+    @Test
+    void testPartitionCountUpperBound() {
+        assertThrows(IllegalArgumentException.class, () ->
+            new AsyncFifoSnsPublisher(snsClient, TOPIC_ARN, 5000, Duration.ofMillis(10)),
+            "partitionCount exceeding 4096 should throw IllegalArgumentException");
+    }
+
+    @Test
+    void testBufferSizeUpperBound() {
+        assertThrows(IllegalArgumentException.class, () ->
+            new AsyncFifoSnsPublisher(snsClient, TOPIC_ARN, 256, Duration.ofMillis(10),
+                2_000_000, 100, null),
+            "bufferSize exceeding 1,000,000 should throw IllegalArgumentException");
+    }
+
+    @Test
+    void testPartitionBufferSizeUpperBound() {
+        assertThrows(IllegalArgumentException.class, () ->
+            new AsyncFifoSnsPublisher(snsClient, TOPIC_ARN, 256, Duration.ofMillis(10),
+                10_000, 20_000, null),
+            "partitionBufferSize exceeding 10,000 should throw IllegalArgumentException");
+    }
+
+    @Test
+    void testValidConfigurationAtUpperBounds() {
+        // Should not throw - valid configuration at max values
+        AsyncFifoSnsPublisher validPublisher = new AsyncFifoSnsPublisher(
+            snsClient, TOPIC_ARN, 4096, Duration.ofMillis(10),
+            1_000_000, 10_000, null);
+        validPublisher.destroy();
     }
 }

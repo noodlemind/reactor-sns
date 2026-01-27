@@ -140,6 +140,19 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     private static final int HIGH_GROUP_COUNT_WARNING_THRESHOLD = 1000;
 
     // ==========================================================================
+    // Constants - Configuration Limits
+    // ==========================================================================
+
+    /** Maximum partition count to prevent excessive memory/thread usage. */
+    private static final int MAX_PARTITION_COUNT = 4096;
+
+    /** Maximum main buffer size to prevent memory exhaustion. */
+    private static final int MAX_BUFFER_SIZE = 1_000_000;
+
+    /** Maximum per-partition buffer size. */
+    private static final int MAX_PARTITION_BUFFER_SIZE = 10_000;
+
+    // ==========================================================================
     // Fields
     // ==========================================================================
 
@@ -205,11 +218,20 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         if (partitionCount <= 0) {
             throw new IllegalArgumentException("partitionCount must be positive");
         }
+        if (partitionCount > MAX_PARTITION_COUNT) {
+            throw new IllegalArgumentException("partitionCount must not exceed " + MAX_PARTITION_COUNT);
+        }
         if (bufferSize <= 0) {
             throw new IllegalArgumentException("bufferSize must be positive");
         }
+        if (bufferSize > MAX_BUFFER_SIZE) {
+            throw new IllegalArgumentException("bufferSize must not exceed " + MAX_BUFFER_SIZE);
+        }
         if (partitionBufferSize <= 0) {
             throw new IllegalArgumentException("partitionBufferSize must be positive");
+        }
+        if (partitionBufferSize > MAX_PARTITION_BUFFER_SIZE) {
+            throw new IllegalArgumentException("partitionBufferSize must not exceed " + MAX_PARTITION_BUFFER_SIZE);
         }
 
         this.partitionCount = partitionCount;
@@ -220,8 +242,9 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         // Thread pool sized for I/O-bound work (network calls to SNS spend most time waiting)
         // Using 8x CPU cores provides good parallelism while threads wait on network I/O
         int threadPoolSize = Math.min(partitionCount, Runtime.getRuntime().availableProcessors() * 8);
-        // Queue cap prevents unbounded memory growth; sized to match upstream buffers
-        int queueCap = bufferSize;
+        // Queue cap prevents unbounded memory growth; sized for all partitions with their buffers
+        // Factor of 2 provides headroom for in-flight work during processing
+        int queueCap = partitionCount * partitionBufferSize * 2;
         this.ioScheduler = Schedulers.newBoundedElastic(threadPoolSize, queueCap, "sns-publisher-io");
     }
 
@@ -360,11 +383,13 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
 
     /**
      * Partitions a list into sublists of at most the specified size.
+     * Returns independent copies (not views) to avoid holding references to the parent list.
      */
     private <T> List<List<T>> partitionList(List<T> list, int size) {
         List<List<T>> result = new ArrayList<>();
         for (int i = 0; i < list.size(); i += size) {
-            result.add(list.subList(i, Math.min(i + size, list.size())));
+            // Copy the sublist to avoid holding a reference to the parent list
+            result.add(new ArrayList<>(list.subList(i, Math.min(i + size, list.size()))));
         }
         return result;
     }
@@ -661,13 +686,32 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * Estimates UTF-8 encoded size without allocating a byte array.
      * For ASCII strings (common in JSON payloads), this is exact.
      * For non-ASCII, this provides a safe upper bound.
+     *
+     * <p>Fast-path: If string is all ASCII (common for JSON), just return length.</p>
      */
     private int estimateUtf8Size(String str) {
         if (str == null) {
             return 0;
         }
+
+        int len = str.length();
+
+        // Fast-path: scan for non-ASCII; if all ASCII, return length directly
+        boolean allAscii = true;
+        for (int i = 0; i < len; i++) {
+            if (str.charAt(i) >= 0x80) {
+                allAscii = false;
+                break;
+            }
+        }
+
+        if (allAscii) {
+            return len;
+        }
+
+        // Slow-path: compute exact size for strings with non-ASCII chars
         int size = 0;
-        for (int i = 0; i < str.length(); i++) {
+        for (int i = 0; i < len; i++) {
             char c = str.charAt(i);
             if (c < 0x80) {
                 size += 1;  // ASCII: 1 byte
