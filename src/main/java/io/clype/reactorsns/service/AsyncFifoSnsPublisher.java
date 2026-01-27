@@ -5,6 +5,7 @@ import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -18,11 +19,13 @@ import org.springframework.beans.factory.DisposableBean;
 
 import io.clype.reactorsns.metrics.SnsPublisherMetrics;
 import io.clype.reactorsns.model.FailedEntry;
+import io.clype.reactorsns.model.FifoOrderingViolationException;
 import io.clype.reactorsns.model.PartialBatchFailureException;
 import io.clype.reactorsns.model.SnsEvent;
 
 import reactor.core.publisher.BufferOverflowStrategy;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.GroupedFlux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
@@ -126,6 +129,23 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     );
 
     // ==========================================================================
+    // Constants - Bounded Group Processing
+    // ==========================================================================
+
+    /**
+     * Maximum number of active message groups per partition.
+     * This bounds memory usage while allowing parallel processing across groups.
+     * When exceeded, new events are buffered until existing groups complete.
+     */
+    private static final int DEFAULT_MAX_GROUPS_PER_PARTITION = 1000;
+
+    /**
+     * Maximum events to buffer per group while waiting for in-flight batch to complete.
+     * Prevents unbounded growth if a single group receives many events while blocked.
+     */
+    private static final int DEFAULT_MAX_BUFFERED_EVENTS_PER_GROUP = 10_000;
+
+    // ==========================================================================
     // Fields
     // ==========================================================================
 
@@ -135,6 +155,8 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     private final Duration batchTimeout;
     private final int bufferSize;
     private final int partitionBufferSize;
+    private final int maxGroupsPerPartition;
+    private final int maxBufferedEventsPerGroup;
     private final SnsPublisherMetrics metrics;
     private final Scheduler ioScheduler;
 
@@ -154,21 +176,24 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      */
     public AsyncFifoSnsPublisher(SnsAsyncClient snsClient, String topicArn,
                                   int partitionCount, Duration batchTimeout) {
-        this(snsClient, topicArn, partitionCount, batchTimeout, 10_000, 100, null);
+        this(snsClient, topicArn, partitionCount, batchTimeout, 10_000, 100,
+                DEFAULT_MAX_GROUPS_PER_PARTITION, DEFAULT_MAX_BUFFERED_EVENTS_PER_GROUP, null);
     }
 
     /**
      * Creates a new AsyncFifoSnsPublisher with full configuration options.
      *
-     * @param snsClient            the AWS SNS async client to use for publishing
-     * @param topicArn             the ARN of the SNS FIFO topic (must end with .fifo)
-     * @param partitionCount       number of logical partitions for parallel processing
-     * @param batchTimeout         maximum time to wait for a batch to fill before sending
-     * @param bufferSize           main buffer size for incoming events (default: 10,000)
-     * @param partitionBufferSize  buffer size per partition for batched events (default: 100)
-     * @param metrics              optional metrics collector (may be null)
+     * @param snsClient                  the AWS SNS async client to use for publishing
+     * @param topicArn                   the ARN of the SNS FIFO topic (must end with .fifo)
+     * @param partitionCount             number of logical partitions for parallel processing
+     * @param batchTimeout               maximum time to wait for a batch to fill before sending
+     * @param bufferSize                 main buffer size for incoming events (default: 10,000)
+     * @param partitionBufferSize        buffer size per partition for batched events (default: 100)
+     * @param maxGroupsPerPartition      max active groups per partition (default: 1,000)
+     * @param maxBufferedEventsPerGroup  max events buffered per group (default: 10,000)
+     * @param metrics                    optional metrics collector (may be null)
      * @throws NullPointerException if snsClient, topicArn, or batchTimeout is null
-     * @throws IllegalArgumentException if partitionCount, bufferSize, or partitionBufferSize is not positive
+     * @throws IllegalArgumentException if any numeric parameter is not positive
      * @throws IllegalArgumentException if topicArn does not match SNS FIFO ARN format
      */
     public AsyncFifoSnsPublisher(
@@ -178,6 +203,8 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
             Duration batchTimeout,
             int bufferSize,
             int partitionBufferSize,
+            int maxGroupsPerPartition,
+            int maxBufferedEventsPerGroup,
             SnsPublisherMetrics metrics) {
 
         this.snsClient = Objects.requireNonNull(snsClient, "snsClient cannot be null");
@@ -197,10 +224,18 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         if (partitionBufferSize <= 0) {
             throw new IllegalArgumentException("partitionBufferSize must be positive");
         }
+        if (maxGroupsPerPartition <= 0) {
+            throw new IllegalArgumentException("maxGroupsPerPartition must be positive");
+        }
+        if (maxBufferedEventsPerGroup <= 0) {
+            throw new IllegalArgumentException("maxBufferedEventsPerGroup must be positive");
+        }
 
         this.partitionCount = partitionCount;
         this.bufferSize = bufferSize;
         this.partitionBufferSize = partitionBufferSize;
+        this.maxGroupsPerPartition = maxGroupsPerPartition;
+        this.maxBufferedEventsPerGroup = maxBufferedEventsPerGroup;
         this.metrics = metrics;
 
         // Thread pool sized for I/O-bound work (network calls to SNS spend most time waiting)
@@ -209,6 +244,21 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         // Queue cap prevents unbounded memory growth; sized to match upstream buffers
         int queueCap = bufferSize;
         this.ioScheduler = Schedulers.newBoundedElastic(threadPoolSize, queueCap, "sns-publisher-io");
+    }
+
+    /**
+     * Creates a new AsyncFifoSnsPublisher with standard configuration options (backwards compatible).
+     */
+    public AsyncFifoSnsPublisher(
+            SnsAsyncClient snsClient,
+            String topicArn,
+            int partitionCount,
+            Duration batchTimeout,
+            int bufferSize,
+            int partitionBufferSize,
+            SnsPublisherMetrics metrics) {
+        this(snsClient, topicArn, partitionCount, batchTimeout, bufferSize, partitionBufferSize,
+                DEFAULT_MAX_GROUPS_PER_PARTITION, DEFAULT_MAX_BUFFERED_EVENTS_PER_GROUP, metrics);
     }
 
     // ==========================================================================
@@ -220,6 +270,10 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      *
      * <p>Events are automatically batched (up to 10 per batch) and published in parallel
      * across partitions while maintaining FIFO ordering per {@code messageGroupId}.</p>
+     *
+     * <p><b>Memory Bounds:</b> This implementation uses bounded memory regardless of
+     * the number of unique messageGroupIds. Events are partitioned by hash, and within
+     * each partition, a bounded number of groups can be active concurrently.</p>
      *
      * <p><b>AWS SNS FIFO Limits (Standard Mode):</b></p>
      * <ul>
@@ -258,43 +312,100 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
                 .flatMap(this::processPartition, partitionCount, 1);
     }
 
+    /**
+     * Computes the partition ID for an event based on its messageGroupId hash.
+     * Events with the same messageGroupId always map to the same partition.
+     */
+    private int computePartitionId(SnsEvent event) {
+        // Use Math.floorMod to handle negative hash codes correctly
+        return Math.floorMod(event.messageGroupId().hashCode(), partitionCount);
+    }
+
     // ==========================================================================
     // Reactive Pipeline Stages (in execution order)
     // ==========================================================================
 
     /**
-     * Computes the partition ID for a message group to ensure FIFO ordering.
-     * Uses positive hash to avoid negative modulo results.
+     * Processes all events for a single partition using bounded memory.
+     *
+     * <p>Uses window-based processing: events are collected into time/size-bounded windows,
+     * then within each window, events are grouped by messageGroupId and processed.</p>
+     *
+     * <p><b>Memory bound:</b> partitionCount × windowSize (partitionBufferSize)</p>
+     *
+     * <p><b>FIFO guarantee:</b> Windows are processed sequentially, so events for the same
+     * messageGroupId in window N complete before events in window N+1 start.</p>
+     *
+     * <p><b>Parallelism:</b> Different messageGroupIds within the same window are processed
+     * in parallel, providing high throughput.</p>
      */
-    private int computePartitionId(SnsEvent event) {
-        return (event.messageGroupId().hashCode() & Integer.MAX_VALUE) % partitionCount;
-    }
-
-    /**
-     * Processes a single partition's event stream: schedules on I/O thread,
-     * batches events, and publishes sequentially to maintain FIFO order.
-     */
-    private Flux<PublishBatchResponse> processPartition(Flux<SnsEvent> partitionFlux) {
+    private Flux<PublishBatchResponse> processPartition(GroupedFlux<Integer, SnsEvent> partitionFlux) {
         return partitionFlux
                 .publishOn(ioScheduler)
-                .transform(this::bufferIntoBatches)
-                .onBackpressureBuffer(partitionBufferSize)
-                .concatMap(this::publishBatchWithMetrics);
+                .bufferTimeout(partitionBufferSize, batchTimeout)
+                .concatMap(this::processWindowedEvents);  // Windows sequential = FIFO across windows
     }
 
     /**
-     * Buffers events into batches by size (max 10) and timeout, then splits
-     * any batches that exceed the 256KB payload limit.
+     * Processes a window of events, grouping by messageGroupId and processing groups in parallel.
+     *
+     * <p>Uses {@code flatMapDelayError} to allow all groups to complete before propagating
+     * any errors. This ensures that if Group A fails, Groups B and C can still complete
+     * their work (independent processing across groups).</p>
      */
-    private Flux<List<SnsEvent>> bufferIntoBatches(Flux<SnsEvent> input) {
-        return input
-                .bufferTimeout(MAX_BATCH_SIZE, batchTimeout)
-                .flatMapIterable(this::splitByPayloadSize, 1);
+    private Flux<PublishBatchResponse> processWindowedEvents(List<SnsEvent> events) {
+        if (events.isEmpty()) {
+            return Flux.empty();
+        }
+
+        // Group events by messageGroupId within this window
+        Map<String, List<SnsEvent>> byGroup = events.stream()
+                .collect(Collectors.groupingBy(SnsEvent::messageGroupId));
+
+        // Check bounded groups limit
+        if (byGroup.size() > maxGroupsPerPartition) {
+            return Flux.error(new IllegalStateException(
+                    "Too many message groups in window: " + byGroup.size() +
+                            " exceeds limit of " + maxGroupsPerPartition));
+        }
+
+        // Process groups in parallel, batches within each group sequentially
+        // Use flatMapDelayError to allow all groups to complete before propagating errors
+        // This ensures one failing group doesn't cancel other independent groups
+        return Flux.fromIterable(byGroup.values())
+                .flatMapDelayError(this::processGroupBatches, Math.min(byGroup.size(), maxGroupsPerPartition), 1);
+    }
+
+    /**
+     * Processes all events for a single messageGroupId within a window.
+     * Events are split into MAX_BATCH_SIZE batches and processed sequentially (FIFO).
+     */
+    private Flux<PublishBatchResponse> processGroupBatches(List<SnsEvent> groupEvents) {
+        // Split into batches of MAX_BATCH_SIZE
+        List<List<SnsEvent>> batches = partitionList(groupEvents, MAX_BATCH_SIZE);
+
+        return Flux.fromIterable(batches)
+                .flatMapIterable(this::splitByPayloadSize, 1)
+                .concatMap(this::publishBatchWithMetrics);  // Sequential within group = FIFO
+    }
+
+    /**
+     * Partitions a list into sublists of at most the specified size.
+     */
+    private <T> List<List<T>> partitionList(List<T> list, int size) {
+        List<List<T>> result = new ArrayList<>();
+        for (int i = 0; i < list.size(); i += size) {
+            result.add(list.subList(i, Math.min(i + size, list.size())));
+        }
+        return result;
     }
 
     /**
      * Splits a batch into smaller sub-batches if the total payload exceeds 256KB.
-     * Ensures each sub-batch stays within SNS payload limits.
+     *
+     * <p>All events in the input batch are guaranteed to have the same messageGroupId
+     * (enforced by upstream {@code groupBy(SnsEvent::messageGroupId)}). This method
+     * only needs to split by payload size to comply with SNS limits.</p>
      */
     private List<List<SnsEvent>> splitByPayloadSize(List<SnsEvent> batch) {
         List<List<SnsEvent>> result = new ArrayList<>();
@@ -357,6 +468,10 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
 
     /**
      * Publishes a batch of events to SNS with retry logic for transient failures.
+     *
+     * <p>Note: Retry is placed AFTER flatMap so PartialBatchFailureException is retried.
+     * On retry, the entire batch is re-sent. SNS FIFO deduplication (5-minute window)
+     * ensures already-successful messages are not duplicated.</p>
      */
     private Mono<PublishBatchResponse> publishBatch(List<SnsEvent> batch) {
         if (batch.isEmpty()) {
@@ -366,8 +481,8 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         PublishBatchRequest request = buildBatchRequest(batch);
 
         return Mono.fromFuture(() -> snsClient.publishBatch(request))
+                .flatMap(response -> handleBatchResponse(response, batch))
                 .retryWhen(createRetrySpec())
-                .flatMap(response -> handleBatchResponse(response, batch.size()))
                 .doOnError(e -> log.error("Failed to publish batch after retries: {}",
                         sanitizeForLog(e.getMessage())));
     }
@@ -396,8 +511,15 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
 
     /**
      * Handles the SNS batch response, converting partial failures to errors.
+     *
+     * <p>Detects FIFO ordering violations: if any successful message has a higher
+     * position than any failed message in the batch, a non-retryable
+     * {@link FifoOrderingViolationException} is thrown because the later message
+     * was already delivered before the earlier one.</p>
      */
-    private Mono<PublishBatchResponse> handleBatchResponse(PublishBatchResponse response, int batchSize) {
+    private Mono<PublishBatchResponse> handleBatchResponse(PublishBatchResponse response, List<SnsEvent> batch) {
+        int batchSize = batch.size();
+
         if (response.failed() == null || response.failed().isEmpty()) {
             log.debug("Successfully published batch of {} events.", batchSize);
             return Mono.just(response);
@@ -415,7 +537,67 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
                 .map(e -> new FailedEntry(e.id(), e.code(), e.message(), e.senderFault()))
                 .toList();
 
+        // Detect FIFO ordering violations
+        if (successCount > 0 && hasFifoViolation(response, batchSize)) {
+            String messageGroupId = batch.get(0).messageGroupId();
+            log.error("FIFO ordering violation detected for messageGroupId '{}': " +
+                    "a message was delivered after a failed message in the same batch. " +
+                    "Cannot retry without causing out-of-order delivery.",
+                    sanitizeForLog(messageGroupId));
+            return Mono.error(new FifoOrderingViolationException(messageGroupId, failedEntries, successCount));
+        }
+
         return Mono.error(new PartialBatchFailureException(failedEntries, successCount));
+    }
+
+    /**
+     * Checks if a partial batch failure resulted in a FIFO ordering violation.
+     *
+     * <p>A violation occurs when a message at a later position in the batch succeeded
+     * while a message at an earlier position failed. Since SNS already delivered the
+     * later message, retrying would cause out-of-order delivery.</p>
+     *
+     * @return true if a FIFO violation is detected
+     */
+    private boolean hasFifoViolation(PublishBatchResponse response, int batchSize) {
+        // Extract positions from entry IDs (format: "dedup-id-{position}")
+        int minFailedPosition = response.failed().stream()
+                .mapToInt(this::extractPosition)
+                .min()
+                .orElse(batchSize);
+
+        int maxSuccessPosition = response.successful().stream()
+                .mapToInt(this::extractPosition)
+                .max()
+                .orElse(-1);
+
+        // FIFO violation: a message after a failed position was delivered
+        return maxSuccessPosition > minFailedPosition;
+    }
+
+    /**
+     * Extracts the batch position from an entry ID.
+     * Entry IDs are formatted as "dedup-id-{position}".
+     */
+    private int extractPosition(Object entry) {
+        String id;
+        if (entry instanceof software.amazon.awssdk.services.sns.model.BatchResultErrorEntry e) {
+            id = e.id();
+        } else if (entry instanceof software.amazon.awssdk.services.sns.model.PublishBatchResultEntry e) {
+            id = e.id();
+        } else {
+            return -1;
+        }
+
+        int lastDash = id.lastIndexOf('-');
+        if (lastDash >= 0 && lastDash < id.length() - 1) {
+            try {
+                return Integer.parseInt(id.substring(lastDash + 1));
+            } catch (NumberFormatException e) {
+                return -1;
+            }
+        }
+        return -1;
     }
 
     /**
@@ -440,6 +622,11 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * Determines if an exception is retryable (transient error).
      */
     private boolean isRetryableException(Throwable throwable) {
+        // Handle partial batch failures - retry only if ALL failures are service-side (not sender faults)
+        if (throwable instanceof PartialBatchFailureException partialEx) {
+            return partialEx.getFailedEntries().stream().noneMatch(FailedEntry::senderFault);
+        }
+
         if (throwable instanceof SnsException snsEx) {
             return isRetryableSnsError(snsEx);
         }

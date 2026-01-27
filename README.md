@@ -89,6 +89,10 @@ Messages with the same `messageGroupId` always route to the same partition, ensu
 - Spring Boot 3.x
 - AWS SDK v2
 
+## OpenTelemetry Compatibility
+
+If using OpenTelemetry Java agent with this library, you must enable Reactor context propagation in your application. See [Reactor Context Propagation](https://projectreactor.io/docs/core/release/reference/#context.propagation) and add `Hooks.enableAutomaticContextPropagation()` at startup.
+
 ## License
 
 [Apache License 2.0](LICENSE)
