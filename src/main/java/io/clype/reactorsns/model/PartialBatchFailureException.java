@@ -13,7 +13,6 @@ public class PartialBatchFailureException extends RuntimeException {
 
     private final List<FailedEntry> failedEntries;
     private final int successCount;
-    private final int failureCount;
 
     /**
      * Creates a new PartialBatchFailureException.
@@ -27,7 +26,6 @@ public class PartialBatchFailureException extends RuntimeException {
               (failedEntries.size() + successCount) + " messages failed");
         this.failedEntries = List.copyOf(failedEntries);
         this.successCount = successCount;
-        this.failureCount = failedEntries.size();
     }
 
     /**
@@ -51,9 +49,9 @@ public class PartialBatchFailureException extends RuntimeException {
     /**
      * Returns the number of messages that failed in the batch.
      *
-     * @return failure count
+     * @return failure count (derived from failedEntries.size())
      */
     public int getFailureCount() {
-        return failureCount;
+        return failedEntries.size();
     }
 }
