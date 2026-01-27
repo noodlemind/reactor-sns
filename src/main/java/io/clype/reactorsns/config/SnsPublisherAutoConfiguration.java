@@ -13,6 +13,8 @@ import org.springframework.context.annotation.Bean;
 import io.clype.reactorsns.metrics.SnsPublisherMetrics;
 import io.clype.reactorsns.service.AsyncFifoSnsPublisher;
 
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.core.retry.RetryPolicy;
 import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
 import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
 import software.amazon.awssdk.regions.Region;
@@ -89,14 +91,27 @@ public class SnsPublisherAutoConfiguration {
      * <p>If a region is specified in properties, it will be used. Otherwise, the client
      * uses the default AWS region provider chain (environment, system properties, profile).</p>
      *
+     * <p><b>Retry Policy:</b> SDK retries are disabled to prevent conflict with Reactor-level
+     * retry logic. The publisher uses its own retry with exponential backoff for transient
+     * failures (throttling, network issues).</p>
+     *
      * @param httpClient the async HTTP client to use for API calls
      * @return the configured SNS async client
      */
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     public SnsAsyncClient snsAsyncClient(SdkAsyncHttpClient httpClient) {
+        // Disable SDK retries - we handle retries at the Reactor level to avoid
+        // retry amplification (SDK retries × Reactor retries = excessive load)
+        ClientOverrideConfiguration overrideConfig = ClientOverrideConfiguration.builder()
+                .retryPolicy(RetryPolicy.none())
+                .apiCallTimeout(properties.getApiCallTimeout())
+                .apiCallAttemptTimeout(properties.getApiCallAttemptTimeout())
+                .build();
+
         var builder = SnsAsyncClient.builder()
-                .httpClient(httpClient);
+                .httpClient(httpClient)
+                .overrideConfiguration(overrideConfig);
 
         if (properties.getRegion() != null && !properties.getRegion().isEmpty()) {
             builder.region(Region.of(properties.getRegion()));
