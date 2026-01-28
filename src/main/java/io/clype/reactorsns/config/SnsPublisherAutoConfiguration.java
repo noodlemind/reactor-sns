@@ -135,7 +135,10 @@ public class SnsPublisherAutoConfiguration {
     @ConditionalOnProperty(prefix = "sns.publisher.rate-limit", name = "enabled", havingValue = "true")
     public SnsRateLimiter snsRateLimiter() {
         var config = properties.getRateLimit();
-        var blockingScheduler = Schedulers.newBoundedElastic(4, 1000, "rate-limit");
+        var blockingScheduler = Schedulers.newBoundedElastic(
+                config.getThreadPoolSize(),
+                config.getThreadPoolSize() * 250,
+                "rate-limit");
         return new SnsRateLimiter(
                 config.getRequestsPerSecond(),
                 config.getMessagesPerGroupPerSecond(),

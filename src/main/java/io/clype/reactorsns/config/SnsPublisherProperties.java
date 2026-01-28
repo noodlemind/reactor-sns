@@ -96,6 +96,7 @@ public class SnsPublisherProperties {
         private int requestsPerSecond = 2500;
         private int messagesPerGroupPerSecond = 250;
         private Duration warmupPeriod = Duration.ZERO;
+        private int threadPoolSize = Math.max(8, Runtime.getRuntime().availableProcessors());
 
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -108,5 +109,8 @@ public class SnsPublisherProperties {
 
         public Duration getWarmupPeriod() { return warmupPeriod; }
         public void setWarmupPeriod(Duration warmupPeriod) { this.warmupPeriod = warmupPeriod; }
+
+        public int getThreadPoolSize() { return threadPoolSize; }
+        public void setThreadPoolSize(int threadPoolSize) { this.threadPoolSize = threadPoolSize; }
     }
 }

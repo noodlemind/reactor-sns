@@ -4,7 +4,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.junit.jupiter.api.AfterEach;
@@ -40,8 +43,8 @@ class SnsRateLimiterTest {
                 .verifyComplete();
         long elapsed = System.nanoTime() - start;
 
-        // Should complete in under 10ms (essentially instant)
-        assertTrue(elapsed < Duration.ofMillis(10).toNanos(),
+        // Should complete in under 100ms (essentially instant, allowing for JIT warmup)
+        assertTrue(elapsed < Duration.ofMillis(100).toNanos(),
                 "Disabled limiter should not block, took " + Duration.ofNanos(elapsed).toMillis() + "ms");
     }
 
@@ -306,5 +309,91 @@ class SnsRateLimiterTest {
                 .verifyComplete();
 
         // If we get here without OOM, the test passes
+    }
+
+    @Test
+    void constructorRejectsInvalidRequestsPerSecond() {
+        blockingScheduler = Schedulers.newBoundedElastic(4, 100, "test-rate-limit");
+        assertThrows(IllegalArgumentException.class, () ->
+            new SnsRateLimiter(0, 100, Duration.ZERO, blockingScheduler));
+        assertThrows(IllegalArgumentException.class, () ->
+            new SnsRateLimiter(-1, 100, Duration.ZERO, blockingScheduler));
+    }
+
+    @Test
+    void constructorRejectsInvalidMessagesPerGroupPerSecond() {
+        blockingScheduler = Schedulers.newBoundedElastic(4, 100, "test-rate-limit");
+        assertThrows(IllegalArgumentException.class, () ->
+            new SnsRateLimiter(100, 0, Duration.ZERO, blockingScheduler));
+        assertThrows(IllegalArgumentException.class, () ->
+            new SnsRateLimiter(100, -1, Duration.ZERO, blockingScheduler));
+    }
+
+    @Test
+    void constructorRejectsNullWarmupPeriod() {
+        blockingScheduler = Schedulers.newBoundedElastic(4, 100, "test-rate-limit");
+        assertThrows(IllegalArgumentException.class, () ->
+            new SnsRateLimiter(100, 100, null, blockingScheduler));
+    }
+
+    @Test
+    void constructorRejectsNullScheduler() {
+        assertThrows(IllegalArgumentException.class, () ->
+            new SnsRateLimiter(100, 100, Duration.ZERO, null));
+    }
+
+    @Test
+    void concurrentRateFactorUpdatesAreThreadSafe() throws InterruptedException {
+        blockingScheduler = Schedulers.newBoundedElastic(4, 100, "test-rate-limit");
+        SnsRateLimiter limiter = new SnsRateLimiter(1000, 100, Duration.ZERO, blockingScheduler);
+
+        int threadCount = 4;
+        int operationsPerThread = 100;
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch doneLatch = new CountDownLatch(threadCount);
+        AtomicBoolean hasError = new AtomicBoolean(false);
+        List<Throwable> errors = new ArrayList<>();
+
+        Thread[] threads = new Thread[threadCount];
+        for (int t = 0; t < threadCount; t++) {
+            final int threadId = t;
+            threads[t] = new Thread(() -> {
+                try {
+                    startLatch.await();
+                    for (int i = 0; i < operationsPerThread; i++) {
+                        if (threadId % 2 == 0) {
+                            limiter.onThrottle(null);
+                        } else {
+                            limiter.onSuccess();
+                        }
+
+                        double factor = limiter.getCurrentRateFactor();
+                        if (factor < 0.1 - 0.001 || factor > 1.0 + 0.001) {
+                            hasError.set(true);
+                            synchronized (errors) {
+                                errors.add(new AssertionError("Rate factor out of bounds: " + factor));
+                            }
+                        }
+                    }
+                } catch (Throwable e) {
+                    hasError.set(true);
+                    synchronized (errors) {
+                        errors.add(e);
+                    }
+                } finally {
+                    doneLatch.countDown();
+                }
+            });
+            threads[t].start();
+        }
+
+        startLatch.countDown();
+        assertTrue(doneLatch.await(30, TimeUnit.SECONDS), "All threads should complete within timeout");
+
+        assertFalse(hasError.get(), "No errors should occur during concurrent updates: " + errors);
+
+        double finalFactor = limiter.getCurrentRateFactor();
+        assertTrue(finalFactor >= 0.1 && finalFactor <= 1.0,
+                "Final rate factor should be within bounds: " + finalFactor);
     }
 }

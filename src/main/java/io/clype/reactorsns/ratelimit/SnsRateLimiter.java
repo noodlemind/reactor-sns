@@ -1,11 +1,15 @@
 package io.clype.reactorsns.ratelimit;
 
 import java.time.Duration;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.DisposableBean;
 
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
@@ -33,7 +37,7 @@ import reactor.core.scheduler.Scheduler;
  * <p><b>Thread Safety:</b> This class is thread-safe. The underlying Guava RateLimiter and Cache
  * are both thread-safe.</p>
  */
-public class SnsRateLimiter {
+public class SnsRateLimiter implements DisposableBean {
 
     private static final Logger log = LoggerFactory.getLogger(SnsRateLimiter.class);
 
@@ -51,7 +55,8 @@ public class SnsRateLimiter {
     private final boolean enabled;
     private final Duration warmupPeriod;
     private final AtomicInteger consecutiveSuccesses = new AtomicInteger(0);
-    private volatile double currentRateFactor = 1.0;
+    private final AtomicReference<Double> currentRateFactor = new AtomicReference<>(1.0);
+    private final Set<String> throttledGroups = ConcurrentHashMap.newKeySet();
 
     /**
      * Creates a disabled rate limiter that passes through all requests immediately.
@@ -84,6 +89,19 @@ public class SnsRateLimiter {
         this.blockingScheduler = blockingScheduler;
 
         if (enabled) {
+            if (requestsPerSecond <= 0) {
+                throw new IllegalArgumentException("requestsPerSecond must be positive, got: " + requestsPerSecond);
+            }
+            if (messagesPerGroupPerSecond <= 0) {
+                throw new IllegalArgumentException("messagesPerGroupPerSecond must be positive, got: " + messagesPerGroupPerSecond);
+            }
+            if (warmupPeriod == null) {
+                throw new IllegalArgumentException("warmupPeriod cannot be null");
+            }
+            if (blockingScheduler == null) {
+                throw new IllegalArgumentException("blockingScheduler cannot be null when rate limiting is enabled");
+            }
+
             this.topicRateLimiter = createRateLimiter(requestsPerSecond, warmupPeriod);
             this.groupRateLimiters = CacheBuilder.newBuilder()
                     .maximumSize(MAX_GROUP_LIMITERS)
@@ -145,18 +163,28 @@ public class SnsRateLimiter {
 
         consecutiveSuccesses.set(0);
 
-        // Reduce topic rate
-        double newFactor = Math.max(currentRateFactor * THROTTLE_REDUCTION_FACTOR, MIN_RATE_FACTOR);
-        if (newFactor < currentRateFactor) {
-            currentRateFactor = newFactor;
-            double newRate = requestsPerSecond * currentRateFactor;
+        // Reduce topic rate atomically using compareAndSet loop
+        double oldFactor;
+        double newFactor;
+        do {
+            oldFactor = currentRateFactor.get();
+            newFactor = Math.max(oldFactor * THROTTLE_REDUCTION_FACTOR, MIN_RATE_FACTOR);
+            if (newFactor >= oldFactor) {
+                // Already at or below the new factor, no update needed
+                break;
+            }
+        } while (!currentRateFactor.compareAndSet(oldFactor, newFactor));
+
+        if (newFactor < oldFactor) {
+            double newRate = requestsPerSecond * newFactor;
             topicRateLimiter.setRate(newRate);
             log.warn("Throttling detected - reducing topic rate to {}/sec ({}% of configured)",
-                    String.format("%.1f", newRate), String.format("%.0f", currentRateFactor * 100));
+                    Math.round(newRate * 10) / 10.0, Math.round(newFactor * 100));
         }
 
         // Also reduce group rate if specified
         if (messageGroupId != null) {
+            throttledGroups.add(messageGroupId);
             RateLimiter groupLimiter = groupRateLimiters.getIfPresent(messageGroupId);
             if (groupLimiter != null) {
                 double currentGroupRate = groupLimiter.getRate();
@@ -164,7 +192,7 @@ public class SnsRateLimiter {
                 double newGroupRate = Math.max(currentGroupRate * THROTTLE_REDUCTION_FACTOR, minGroupRate);
                 if (newGroupRate < currentGroupRate) {
                     groupLimiter.setRate(newGroupRate);
-                    log.debug("Reducing rate for group '{}' to {}/sec", messageGroupId, String.format("%.1f", newGroupRate));
+                    log.debug("Reducing rate for group '{}' to {}/sec", messageGroupId, Math.round(newGroupRate * 10) / 10.0);
                 }
             }
         }
@@ -176,20 +204,52 @@ public class SnsRateLimiter {
      * <p>After enough consecutive successes, gradually recovers the rate toward the configured maximum.</p>
      */
     public void onSuccess() {
-        if (!enabled || currentRateFactor >= 1.0) {
+        if (!enabled || currentRateFactor.get() >= 1.0) {
             return;
         }
 
         // Recover after 10 consecutive successes
         if (consecutiveSuccesses.incrementAndGet() >= 10) {
             consecutiveSuccesses.set(0);
-            double newFactor = Math.min(currentRateFactor * RECOVERY_INCREASE_FACTOR, 1.0);
-            if (newFactor > currentRateFactor) {
-                currentRateFactor = newFactor;
-                double newRate = requestsPerSecond * currentRateFactor;
+
+            // Increase rate atomically using compareAndSet loop
+            double oldFactor;
+            double newFactor;
+            do {
+                oldFactor = currentRateFactor.get();
+                newFactor = Math.min(oldFactor * RECOVERY_INCREASE_FACTOR, 1.0);
+                if (newFactor <= oldFactor) {
+                    // Already at or above the new factor, no update needed
+                    break;
+                }
+            } while (!currentRateFactor.compareAndSet(oldFactor, newFactor));
+
+            if (newFactor > oldFactor) {
+                double newRate = requestsPerSecond * newFactor;
                 topicRateLimiter.setRate(newRate);
                 log.info("Recovering topic rate to {}/sec ({}% of configured)",
-                        String.format("%.1f", newRate), String.format("%.0f", currentRateFactor * 100));
+                        Math.round(newRate * 10) / 10.0, Math.round(newFactor * 100));
+            }
+
+            // Also recover throttled groups
+            if (!throttledGroups.isEmpty()) {
+                for (String groupId : throttledGroups) {
+                    RateLimiter groupLimiter = groupRateLimiters.getIfPresent(groupId);
+                    if (groupLimiter != null) {
+                        double currentRate = groupLimiter.getRate();
+                        double targetRate = messagesPerGroupPerSecond * currentRateFactor.get();
+                        if (currentRate < targetRate) {
+                            double newGroupRate = Math.min(currentRate * RECOVERY_INCREASE_FACTOR, targetRate);
+                            groupLimiter.setRate(newGroupRate);
+                            log.debug("Recovering rate for group '{}' to {}/sec", groupId, Math.round(newGroupRate * 10) / 10.0);
+                        }
+                        if (currentRate >= targetRate * 0.99) {
+                            throttledGroups.remove(groupId);
+                        }
+                    } else {
+                        throttledGroups.remove(groupId);
+                    }
+                }
             }
         }
     }
@@ -200,7 +260,7 @@ public class SnsRateLimiter {
      * @return current rate factor between MIN_RATE_FACTOR and 1.0
      */
     public double getCurrentRateFactor() {
-        return currentRateFactor;
+        return currentRateFactor.get();
     }
 
     /**
@@ -210,6 +270,17 @@ public class SnsRateLimiter {
      */
     public boolean isEnabled() {
         return enabled;
+    }
+
+    /**
+     * Disposes the blocking scheduler when the bean is destroyed.
+     */
+    @Override
+    public void destroy() {
+        if (enabled && blockingScheduler != null) {
+            blockingScheduler.dispose();
+            log.info("Rate limiter scheduler disposed");
+        }
     }
 
     private static RateLimiter createRateLimiter(int permitsPerSecond, Duration warmupPeriod) {
