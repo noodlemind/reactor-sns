@@ -16,9 +16,12 @@ import org.mockito.ArgumentCaptor;
 import io.clype.reactorsns.model.FifoOrderingViolationException;
 import io.clype.reactorsns.model.PartialBatchFailureException;
 import io.clype.reactorsns.model.SnsEvent;
+import io.clype.reactorsns.ratelimit.SnsRateLimiter;
 
 import reactor.core.Exceptions;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.test.StepVerifier;
 
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
@@ -315,15 +318,16 @@ class AsyncFifoSnsPublisherTest {
 
     @Test
     void testRetryExhaustionAfterMaxAttempts() {
-        // Always return throttling error (senderFault=false)
+        // Use ServiceUnavailable (non-throttling retryable error) to test basic retry exhaustion.
+        // Throttling errors have a much higher retry limit (20) with longer backoffs.
         when(snsClient.publishBatch(any(PublishBatchRequest.class)))
             .thenAnswer(invocation -> CompletableFuture.completedFuture(
                 PublishBatchResponse.builder()
                     .failed(List.of(
                         BatchResultErrorEntry.builder()
                             .id("dedup-0-0")
-                            .code("Throttling")
-                            .message("Rate exceeded")
+                            .code("ServiceUnavailable")
+                            .message("Service temporarily unavailable")
                             .senderFault(false)
                             .build()))
                     .build()));
@@ -337,7 +341,7 @@ class AsyncFifoSnsPublisherTest {
                 e.getCause() instanceof PartialBatchFailureException)
             .verify(Duration.ofSeconds(30));
 
-        // 1 initial + 3 retries (MAX_RETRIES) = 4 total calls
+        // 1 initial + 3 retries (MAX_RETRIES for non-throttling) = 4 total calls
         verify(snsClient, times(4)).publishBatch(any(PublishBatchRequest.class));
     }
 
@@ -639,5 +643,96 @@ class AsyncFifoSnsPublisherTest {
 
         assertThrows(NullPointerException.class, () ->
             publisher.publishEvents(null, x -> new SnsEvent("g", "d", "p")));
+    }
+
+    // ==========================================================================
+    // Rate Limiting Integration Tests
+    // ==========================================================================
+
+    @Test
+    void publisherWithRateLimiterEnforcesRateLimit() {
+        // Create a rate limiter with low limits for testing
+        Scheduler rateLimitScheduler = Schedulers.newBoundedElastic(4, 100, "rate-limit-test");
+        SnsRateLimiter rateLimiter = new SnsRateLimiter(10, 100, Duration.ZERO, rateLimitScheduler);
+
+        AsyncFifoSnsPublisher rateLimitedPublisher = new AsyncFifoSnsPublisher(
+                snsClient, TOPIC_ARN, 10, Duration.ofMillis(50),
+                10_000, 100, 100, null, rateLimiter);
+
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+            .thenAnswer(invocation -> {
+                PublishBatchRequest req = invocation.getArgument(0);
+                List<PublishBatchResultEntry> results = req.publishBatchRequestEntries().stream()
+                    .map(e -> PublishBatchResultEntry.builder().id(e.id()).build())
+                    .collect(Collectors.toList());
+                return CompletableFuture.completedFuture(
+                    PublishBatchResponse.builder().successful(results).build());
+            });
+
+        // 15 events = 2 batches (10 + 5) at 10 requests/sec should take ~100ms
+        List<SnsEvent> events = new ArrayList<>();
+        for (int i = 0; i < 15; i++) {
+            events.add(new SnsEvent("group1", "dedup-" + i, "payload-" + i));
+        }
+
+        long start = System.nanoTime();
+        StepVerifier.create(rateLimitedPublisher.publishEvents(Flux.fromIterable(events)))
+            .expectNextCount(2)
+            .verifyComplete();
+        long elapsed = System.nanoTime() - start;
+
+        // Should take at least 50ms due to rate limiting (2 batches at 10/sec = 100ms theoretically)
+        // Using a lower bound to account for timing variations
+        long elapsedMs = Duration.ofNanos(elapsed).toMillis();
+        if (elapsedMs < 50) {
+            throw new AssertionError("Rate limiter should slow down publishing, took " + elapsedMs + "ms");
+        }
+
+        rateLimitedPublisher.destroy();
+        rateLimitScheduler.dispose();
+    }
+
+    @Test
+    void publisherWithDisabledRateLimiterDoesNotBlock() {
+        AsyncFifoSnsPublisher noLimitPublisher = new AsyncFifoSnsPublisher(
+                snsClient, TOPIC_ARN, 10, Duration.ofMillis(50),
+                10_000, 100, 100, null, SnsRateLimiter.disabled());
+
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+            .thenAnswer(invocation -> {
+                PublishBatchRequest req = invocation.getArgument(0);
+                List<PublishBatchResultEntry> results = req.publishBatchRequestEntries().stream()
+                    .map(e -> PublishBatchResultEntry.builder().id(e.id()).build())
+                    .collect(Collectors.toList());
+                return CompletableFuture.completedFuture(
+                    PublishBatchResponse.builder().successful(results).build());
+            });
+
+        List<SnsEvent> events = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            events.add(new SnsEvent("group1", "dedup-" + i, "payload-" + i));
+        }
+
+        long start = System.nanoTime();
+        StepVerifier.create(noLimitPublisher.publishEvents(Flux.fromIterable(events)))
+            .expectNextCount(2)
+            .verifyComplete();
+        long elapsed = System.nanoTime() - start;
+
+        // With no rate limiting, should complete in under 1 second (just batching delay)
+        long elapsedMs = Duration.ofNanos(elapsed).toMillis();
+        if (elapsedMs >= 1000) {
+            throw new AssertionError("Disabled rate limiter should not add delay, took " + elapsedMs + "ms");
+        }
+
+        noLimitPublisher.destroy();
+    }
+
+    @Test
+    void rateLimiterNullCheckInConstructor() {
+        assertThrows(NullPointerException.class, () ->
+            new AsyncFifoSnsPublisher(snsClient, TOPIC_ARN, 10, Duration.ofMillis(50),
+                10_000, 100, 100, null, null),
+            "rateLimiter cannot be null");
     }
 }

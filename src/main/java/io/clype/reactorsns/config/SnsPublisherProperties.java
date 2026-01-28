@@ -60,6 +60,11 @@ public class SnsPublisherProperties {
     public BackpressureConfig getBackpressure() { return backpressure; }
     public void setBackpressure(BackpressureConfig backpressure) { this.backpressure = backpressure; }
 
+    private RateLimitConfig rateLimit = new RateLimitConfig();
+
+    public RateLimitConfig getRateLimit() { return rateLimit; }
+    public void setRateLimit(RateLimitConfig rateLimit) { this.rateLimit = rateLimit; }
+
     /** Metrics configuration. */
     public static class MetricsConfig {
         private boolean enabled = true;
@@ -78,5 +83,30 @@ public class SnsPublisherProperties {
 
         public int getPartitionBufferSize() { return partitionBufferSize; }
         public void setPartitionBufferSize(int partitionBufferSize) { this.partitionBufferSize = partitionBufferSize; }
+    }
+
+    /**
+     * Rate limiting configuration for proactive throttling prevention.
+     *
+     * <p>When enabled, enforces token bucket rate limiting at both topic and message group levels
+     * to prevent AWS SNS FIFO throttling errors (HTTP 429 / ThrottlingException).</p>
+     */
+    public static class RateLimitConfig {
+        private boolean enabled = false;
+        private int requestsPerSecond = 2500;
+        private int messagesPerGroupPerSecond = 250;
+        private Duration warmupPeriod = Duration.ZERO;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+        public int getRequestsPerSecond() { return requestsPerSecond; }
+        public void setRequestsPerSecond(int requestsPerSecond) { this.requestsPerSecond = requestsPerSecond; }
+
+        public int getMessagesPerGroupPerSecond() { return messagesPerGroupPerSecond; }
+        public void setMessagesPerGroupPerSecond(int messagesPerGroupPerSecond) { this.messagesPerGroupPerSecond = messagesPerGroupPerSecond; }
+
+        public Duration getWarmupPeriod() { return warmupPeriod; }
+        public void setWarmupPeriod(Duration warmupPeriod) { this.warmupPeriod = warmupPeriod; }
     }
 }

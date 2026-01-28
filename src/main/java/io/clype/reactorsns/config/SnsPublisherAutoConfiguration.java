@@ -11,7 +11,10 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean;
 
 import io.clype.reactorsns.metrics.SnsPublisherMetrics;
+import io.clype.reactorsns.ratelimit.SnsRateLimiter;
 import io.clype.reactorsns.service.AsyncFifoSnsPublisher;
+
+import reactor.core.scheduler.Schedulers;
 
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.retry.RetryPolicy;
@@ -120,14 +123,36 @@ public class SnsPublisherAutoConfiguration {
     }
 
     /**
+     * Creates the rate limiter bean when rate limiting is enabled.
+     *
+     * <p>Uses a dedicated bounded elastic scheduler for blocking acquire operations
+     * to avoid starving I/O threads.</p>
+     *
+     * @return the configured rate limiter
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "sns.publisher.rate-limit", name = "enabled", havingValue = "true")
+    public SnsRateLimiter snsRateLimiter() {
+        var config = properties.getRateLimit();
+        var blockingScheduler = Schedulers.newBoundedElastic(4, 1000, "rate-limit");
+        return new SnsRateLimiter(
+                config.getRequestsPerSecond(),
+                config.getMessagesPerGroupPerSecond(),
+                config.getWarmupPeriod(),
+                blockingScheduler);
+    }
+
+    /**
      * Creates the async FIFO SNS publisher bean.
      *
      * <p>The publisher is configured with the topic ARN, partition count, batch timeout,
      * backpressure settings, rate limiting, and optional metrics from the application
      * properties.</p>
      *
-     * @param snsClient the SNS async client to use for publishing
-     * @param metrics   optional metrics collector (may be null if metrics are disabled)
+     * @param snsClient   the SNS async client to use for publishing
+     * @param metrics     optional metrics collector (may be null if metrics are disabled)
+     * @param rateLimiter optional rate limiter (may be null if rate limiting is disabled)
      * @return the configured publisher instance
      */
     @Bean
@@ -135,7 +160,8 @@ public class SnsPublisherAutoConfiguration {
     @ConditionalOnBean(SnsAsyncClient.class)
     public AsyncFifoSnsPublisher asyncFifoSnsPublisher(
             SnsAsyncClient snsClient,
-            @Autowired(required = false) SnsPublisherMetrics metrics) {
+            @Autowired(required = false) SnsPublisherMetrics metrics,
+            @Autowired(required = false) SnsRateLimiter rateLimiter) {
         var bp = properties.getBackpressure();
 
         return new AsyncFifoSnsPublisher(
@@ -146,6 +172,7 @@ public class SnsPublisherAutoConfiguration {
                 bp.getBufferSize(),
                 bp.getPartitionBufferSize(),
                 properties.getMaxConnections(),
-                metrics);
+                metrics,
+                rateLimiter != null ? rateLimiter : SnsRateLimiter.disabled());
     }
 }

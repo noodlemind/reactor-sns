@@ -23,7 +23,9 @@ import io.clype.reactorsns.model.FailedEntry;
 import io.clype.reactorsns.model.FifoOrderingViolationException;
 import io.clype.reactorsns.model.PartialBatchFailureException;
 import io.clype.reactorsns.model.SnsEvent;
+import io.clype.reactorsns.ratelimit.SnsRateLimiter;
 
+import reactor.core.Exceptions;
 import reactor.core.publisher.BufferOverflowStrategy;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.GroupedFlux;
@@ -112,8 +114,11 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     // Constants - Retry Configuration
     // ==========================================================================
 
-    /** Maximum number of retry attempts for transient failures. */
+    /** Maximum number of retry attempts for non-throttling transient failures. */
     private static final int MAX_RETRIES = 3;
+
+    /** Maximum number of retry attempts for throttling errors (much higher since throttling is transient). */
+    private static final int MAX_THROTTLE_RETRIES = 20;
 
     /** Minimum backoff duration between retries. */
     private static final Duration RETRY_MIN_BACKOFF = Duration.ofMillis(100);
@@ -121,8 +126,14 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     /** Maximum backoff duration between retries. */
     private static final Duration RETRY_MAX_BACKOFF = Duration.ofSeconds(5);
 
+    /** Maximum backoff duration for throttling retries (longer to allow rate to recover). */
+    private static final Duration THROTTLE_RETRY_MAX_BACKOFF = Duration.ofSeconds(30);
+
     /** Jitter factor for retry backoff (0.5 = 50% randomization). */
     private static final double RETRY_JITTER = 0.5;
+
+    /** AWS error codes that indicate throttling (rate limiting). */
+    private static final Set<String> THROTTLING_ERROR_CODES = Set.of("Throttling");
 
     /** AWS error codes that indicate transient failures eligible for retry. */
     private static final Set<String> RETRYABLE_ERROR_CODES = Set.of(
@@ -164,6 +175,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     private final int bufferSize;
     private final int partitionBufferSize;
     private final SnsPublisherMetrics metrics;
+    private final SnsRateLimiter rateLimiter;
     private final Scheduler ioScheduler;
 
     // ==========================================================================
@@ -185,7 +197,8 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      */
     public AsyncFifoSnsPublisher(SnsAsyncClient snsClient, String topicArn,
                                   int partitionCount, Duration batchTimeout) {
-        this(snsClient, topicArn, partitionCount, batchTimeout, 10_000, 100, DEFAULT_MAX_CONNECTIONS, null);
+        this(snsClient, topicArn, partitionCount, batchTimeout, 10_000, 100, DEFAULT_MAX_CONNECTIONS, null,
+                SnsRateLimiter.disabled());
     }
 
     /**
@@ -201,7 +214,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * @throws NullPointerException if snsClient, topicArn, or batchTimeout is null
      * @throws IllegalArgumentException if any numeric parameter is not positive
      * @throws IllegalArgumentException if topicArn does not match SNS FIFO ARN format
-     * @deprecated Use the constructor with maxConnections parameter for optimal thread pool sizing
+     * @deprecated Use the constructor with maxConnections and rateLimiter parameters
      */
     @Deprecated
     public AsyncFifoSnsPublisher(
@@ -213,7 +226,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
             int partitionBufferSize,
             SnsPublisherMetrics metrics) {
         this(snsClient, topicArn, partitionCount, batchTimeout, bufferSize, partitionBufferSize,
-                DEFAULT_MAX_CONNECTIONS, metrics);
+                DEFAULT_MAX_CONNECTIONS, metrics, SnsRateLimiter.disabled());
     }
 
     /**
@@ -230,7 +243,9 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * @throws NullPointerException if snsClient, topicArn, or batchTimeout is null
      * @throws IllegalArgumentException if any numeric parameter is not positive
      * @throws IllegalArgumentException if topicArn does not match SNS FIFO ARN format
+     * @deprecated Use the constructor with rateLimiter parameter for rate limiting support
      */
+    @Deprecated
     public AsyncFifoSnsPublisher(
             SnsAsyncClient snsClient,
             String topicArn,
@@ -240,10 +255,41 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
             int partitionBufferSize,
             int maxConnections,
             SnsPublisherMetrics metrics) {
+        this(snsClient, topicArn, partitionCount, batchTimeout, bufferSize, partitionBufferSize,
+                maxConnections, metrics, SnsRateLimiter.disabled());
+    }
+
+    /**
+     * Creates a new AsyncFifoSnsPublisher with full configuration options including rate limiting.
+     *
+     * @param snsClient            the AWS SNS async client to use for publishing
+     * @param topicArn             the ARN of the SNS FIFO topic (must end with .fifo)
+     * @param partitionCount       number of logical partitions for parallel processing
+     * @param batchTimeout         maximum time to wait for a batch to fill before sending
+     * @param bufferSize           main buffer size for incoming events (default: 10,000)
+     * @param partitionBufferSize  buffer size per partition for batched events (default: 100)
+     * @param maxConnections       HTTP client connection pool size (used to size thread pool)
+     * @param metrics              optional metrics collector (may be null)
+     * @param rateLimiter          rate limiter for throttling prevention (use SnsRateLimiter.disabled() to disable)
+     * @throws NullPointerException if snsClient, topicArn, batchTimeout, or rateLimiter is null
+     * @throws IllegalArgumentException if any numeric parameter is not positive
+     * @throws IllegalArgumentException if topicArn does not match SNS FIFO ARN format
+     */
+    public AsyncFifoSnsPublisher(
+            SnsAsyncClient snsClient,
+            String topicArn,
+            int partitionCount,
+            Duration batchTimeout,
+            int bufferSize,
+            int partitionBufferSize,
+            int maxConnections,
+            SnsPublisherMetrics metrics,
+            SnsRateLimiter rateLimiter) {
 
         this.snsClient = Objects.requireNonNull(snsClient, "snsClient cannot be null");
         this.topicArn = Objects.requireNonNull(topicArn, "topicArn cannot be null");
         this.batchTimeout = Objects.requireNonNull(batchTimeout, "batchTimeout cannot be null");
+        this.rateLimiter = Objects.requireNonNull(rateLimiter, "rateLimiter cannot be null");
 
         if (!SNS_FIFO_ARN_PATTERN.matcher(topicArn).matches()) {
             throw new IllegalArgumentException(
@@ -484,20 +530,25 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     }
 
     /**
-     * Wraps batch publishing with metrics collection (if metrics are enabled).
+     * Wraps batch publishing with rate limiting and metrics collection.
      */
     private Mono<PublishBatchResponse> publishBatchWithMetrics(List<SnsEvent> batch) {
+        String messageGroupId = batch.get(0).messageGroupId();
+        int messageCount = batch.size();
+
+        Mono<PublishBatchResponse> publishMono = rateLimiter.acquirePermit(messageGroupId, messageCount)
+                .then(Mono.defer(() -> publishBatch(batch, messageGroupId)));
+
         if (metrics == null) {
-            return publishBatch(batch);
+            return publishMono;
         }
 
         final long startTime = System.nanoTime();
-        final int batchSize = batch.size();
         metrics.incrementActiveRequests();
 
-        return publishBatch(batch)
+        return publishMono
                 .doOnSuccess(response -> recordSuccessMetrics(response, startTime))
-                .doOnError(e -> metrics.recordBatchFailure(batchSize))
+                .doOnError(e -> metrics.recordBatchFailure(messageCount))
                 .doFinally(signal -> metrics.decrementActiveRequests());
     }
 
@@ -521,8 +572,11 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * <p>Note: Retry is placed AFTER flatMap so PartialBatchFailureException is retried.
      * On retry, the entire batch is re-sent. SNS FIFO deduplication (5-minute window)
      * ensures already-successful messages are not duplicated.</p>
+     *
+     * <p>Throttling errors receive special handling with more aggressive retry and
+     * adaptive rate limiting to prevent stream failure.</p>
      */
-    private Mono<PublishBatchResponse> publishBatch(List<SnsEvent> batch) {
+    private Mono<PublishBatchResponse> publishBatch(List<SnsEvent> batch, String messageGroupId) {
         if (batch.isEmpty()) {
             return Mono.empty();
         }
@@ -531,9 +585,34 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
 
         return Mono.fromFuture(() -> snsClient.publishBatch(request))
                 .flatMap(response -> handleBatchResponse(response, batch))
-                .retryWhen(createRetrySpec())
+                .doOnError(e -> notifyRateLimiterOnThrottle(e, messageGroupId))
+                .retryWhen(createRetrySpec(messageGroupId))
+                .doOnSuccess(response -> rateLimiter.onSuccess())
                 .doOnError(e -> log.error("Failed to publish batch after retries: {}",
                         sanitizeForLog(e.getMessage())));
+    }
+
+    /**
+     * Notifies the rate limiter when a throttling error is detected.
+     */
+    private void notifyRateLimiterOnThrottle(Throwable e, String messageGroupId) {
+        if (isThrottlingException(e)) {
+            rateLimiter.onThrottle(messageGroupId);
+        }
+    }
+
+    /**
+     * Checks if the exception indicates a throttling error.
+     */
+    private boolean isThrottlingException(Throwable throwable) {
+        if (throwable instanceof PartialBatchFailureException partialEx) {
+            return partialEx.getFailedEntries().stream()
+                    .anyMatch(entry -> THROTTLING_ERROR_CODES.contains(entry.code()));
+        }
+        if (throwable instanceof SnsException snsEx && snsEx.awsErrorDetails() != null) {
+            return THROTTLING_ERROR_CODES.contains(snsEx.awsErrorDetails().errorCode());
+        }
+        return false;
     }
 
     /**
@@ -682,16 +761,47 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
 
     /**
      * Creates the retry specification for transient failure handling.
+     *
+     * <p>Uses a two-tier retry strategy:</p>
+     * <ul>
+     *   <li><b>Throttling errors:</b> Up to 20 retries with max 30s backoff (throttling is transient)</li>
+     *   <li><b>Other transient errors:</b> Up to 3 retries with max 5s backoff</li>
+     * </ul>
+     *
+     * @param messageGroupId used for logging context
      */
-    private Retry createRetrySpec() {
-        return Retry.backoff(MAX_RETRIES, RETRY_MIN_BACKOFF)
-                .maxBackoff(RETRY_MAX_BACKOFF)
-                .jitter(RETRY_JITTER)
-                .filter(this::isRetryableException)
-                .doBeforeRetry(signal ->
-                        log.warn("Retrying batch publication (attempt {}): {}",
-                                signal.totalRetries() + 1,
-                                sanitizeForLog(signal.failure().getMessage())));
+    private Retry createRetrySpec(String messageGroupId) {
+        return Retry.from(companion -> companion.flatMap(retrySignal -> {
+            Throwable failure = retrySignal.failure();
+            long attempt = retrySignal.totalRetries() + 1;
+            boolean isThrottling = isThrottlingException(failure);
+            int maxRetries = isThrottling ? MAX_THROTTLE_RETRIES : MAX_RETRIES;
+            Duration maxBackoff = isThrottling ? THROTTLE_RETRY_MAX_BACKOFF : RETRY_MAX_BACKOFF;
+
+            // Check if retryable
+            if (!isRetryableException(failure)) {
+                return Mono.error(failure);
+            }
+
+            // Check if retries exhausted
+            if (attempt > maxRetries) {
+                return Mono.error(Exceptions.retryExhausted(
+                        "Retries exhausted: " + maxRetries + "/" + maxRetries, failure));
+            }
+
+            // Calculate backoff with exponential growth and jitter
+            long baseBackoffMs = RETRY_MIN_BACKOFF.toMillis() * (1L << Math.min(attempt - 1, 10));
+            long cappedBackoffMs = Math.min(baseBackoffMs, maxBackoff.toMillis());
+            double jitter = 1.0 + (Math.random() - 0.5) * RETRY_JITTER;
+            long actualBackoffMs = (long) (cappedBackoffMs * jitter);
+
+            String retryType = isThrottling ? "throttling" : "transient";
+            log.warn("Retrying batch publication for group '{}' (attempt {}/{}, {}, backoff {}ms): {}",
+                    sanitizeForLog(messageGroupId), attempt, maxRetries, retryType, actualBackoffMs,
+                    sanitizeForLog(failure.getMessage()));
+
+            return Mono.delay(Duration.ofMillis(actualBackoffMs));
+        }));
     }
 
     // ==========================================================================
