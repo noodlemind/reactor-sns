@@ -599,4 +599,45 @@ class AsyncFifoSnsPublisherTest {
             1_000_000, 10_000, null);
         validPublisher.destroy();
     }
+
+    // ==========================================================================
+    // Generic Converter Tests
+    // ==========================================================================
+
+    record TestDomainEvent(String groupId, String dedupId, String data) {}
+
+    @Test
+    void publishEventsWithConverter() {
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+            .thenAnswer(invocation -> {
+                PublishBatchRequest req = invocation.getArgument(0);
+                List<PublishBatchResultEntry> results = req.publishBatchRequestEntries().stream()
+                    .map(e -> PublishBatchResultEntry.builder().id(e.id()).build())
+                    .collect(Collectors.toList());
+                return CompletableFuture.completedFuture(
+                    PublishBatchResponse.builder().successful(results).build());
+            });
+
+        List<TestDomainEvent> events = List.of(
+            new TestDomainEvent("loan-123", "event-1", "payload-1"),
+            new TestDomainEvent("loan-123", "event-2", "payload-2")
+        );
+
+        StepVerifier.create(publisher.publishEvents(
+                Flux.fromIterable(events),
+                e -> new SnsEvent(e.groupId(), e.dedupId(), e.data())))
+            .expectNextCount(1)
+            .verifyComplete();
+
+        verify(snsClient, times(1)).publishBatch(any(PublishBatchRequest.class));
+    }
+
+    @Test
+    void publishEventsWithConverterRejectsNull() {
+        assertThrows(NullPointerException.class, () ->
+            publisher.publishEvents(Flux.just("x"), null));
+
+        assertThrows(NullPointerException.class, () ->
+            publisher.publishEvents(null, x -> new SnsEvent("g", "d", "p")));
+    }
 }

@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -334,6 +335,23 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
                 .onBackpressureBuffer(bufferSize, BufferOverflowStrategy.ERROR)
                 .groupBy(this::computePartitionId)
                 .flatMap(this::processPartition, partitionCount, 1);
+    }
+
+    /**
+     * Publishes domain events after converting each to {@link SnsEvent}.
+     *
+     * @param <T> the domain event type
+     * @param eventStream the stream of events to publish
+     * @param toSnsEvent function to convert each event to SnsEvent
+     * @return a Flux of batch responses
+     * @throws NullPointerException if either parameter is null
+     */
+    public <T> Flux<PublishBatchResponse> publishEvents(
+            Flux<T> eventStream,
+            Function<T, SnsEvent> toSnsEvent) {
+        Objects.requireNonNull(eventStream, "eventStream");
+        Objects.requireNonNull(toSnsEvent, "toSnsEvent");
+        return publishEvents(eventStream.map(toSnsEvent));
     }
 
     /**
