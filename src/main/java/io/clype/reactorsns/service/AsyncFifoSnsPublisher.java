@@ -536,8 +536,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         String messageGroupId = batch.get(0).messageGroupId();
         int messageCount = batch.size();
 
-        Mono<PublishBatchResponse> publishMono = rateLimiter.acquirePermit(messageGroupId, messageCount)
-                .then(Mono.defer(() -> publishBatch(batch, messageGroupId)));
+        Mono<PublishBatchResponse> publishMono = publishBatch(batch, messageGroupId, messageCount);
 
         if (metrics == null) {
             return publishMono;
@@ -575,15 +574,19 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      *
      * <p>Throttling errors receive special handling with more aggressive retry and
      * adaptive rate limiting to prevent stream failure.</p>
+     *
+     * <p>Rate limiting is applied inside the retry loop so each attempt (including retries)
+     * is gated by the rate limiter, preventing retry bursts from bypassing configured limits.</p>
      */
-    private Mono<PublishBatchResponse> publishBatch(List<SnsEvent> batch, String messageGroupId) {
+    private Mono<PublishBatchResponse> publishBatch(List<SnsEvent> batch, String messageGroupId, int messageCount) {
         if (batch.isEmpty()) {
             return Mono.empty();
         }
 
         PublishBatchRequest request = buildBatchRequest(batch);
 
-        return Mono.fromFuture(() -> snsClient.publishBatch(request))
+        return Mono.defer(() -> rateLimiter.acquirePermit(messageGroupId, messageCount)
+                        .then(Mono.fromFuture(() -> snsClient.publishBatch(request))))
                 .flatMap(response -> handleBatchResponse(response, batch))
                 .doOnError(e -> notifyRateLimiterOnThrottle(e, messageGroupId))
                 .retryWhen(createRetrySpec(messageGroupId))

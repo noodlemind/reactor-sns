@@ -164,8 +164,9 @@ public class SnsRateLimiter implements DisposableBean {
         consecutiveSuccesses.set(0);
 
         // Reduce topic rate atomically using compareAndSet loop
-        double oldFactor;
-        double newFactor;
+        // Note: Must use Double objects (not primitives) to preserve reference equality for CAS
+        Double oldFactor;
+        Double newFactor;
         do {
             oldFactor = currentRateFactor.get();
             newFactor = Math.max(oldFactor * THROTTLE_REDUCTION_FACTOR, MIN_RATE_FACTOR);
@@ -213,8 +214,9 @@ public class SnsRateLimiter implements DisposableBean {
             consecutiveSuccesses.set(0);
 
             // Increase rate atomically using compareAndSet loop
-            double oldFactor;
-            double newFactor;
+            // Note: Must use Double objects (not primitives) to preserve reference equality for CAS
+            Double oldFactor;
+            Double newFactor;
             do {
                 oldFactor = currentRateFactor.get();
                 newFactor = Math.min(oldFactor * RECOVERY_INCREASE_FACTOR, 1.0);
@@ -242,8 +244,12 @@ public class SnsRateLimiter implements DisposableBean {
                             double newGroupRate = Math.min(currentRate * RECOVERY_INCREASE_FACTOR, targetRate);
                             groupLimiter.setRate(newGroupRate);
                             log.debug("Recovering rate for group '{}' to {}/sec", groupId, Math.round(newGroupRate * 10) / 10.0);
-                        }
-                        if (currentRate >= targetRate * 0.99) {
+                            // Check removal using the updated rate
+                            if (newGroupRate >= targetRate * 0.99) {
+                                throttledGroups.remove(groupId);
+                            }
+                        } else {
+                            // Already at or above target, remove from throttled set
                             throttledGroups.remove(groupId);
                         }
                     } else {
