@@ -6,6 +6,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.DoubleUnaryOperator;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,6 +47,10 @@ public class SnsRateLimiter implements DisposableBean {
     private static final double MIN_RATE_FACTOR = 0.1;  // Don't go below 10% of configured rate
     private static final double THROTTLE_REDUCTION_FACTOR = 0.5;  // Reduce by 50% on throttle
     private static final double RECOVERY_INCREASE_FACTOR = 1.1;  // Increase by 10% on success
+    private static final int CONSECUTIVE_SUCCESSES_FOR_RECOVERY = 10;
+    private static final double RECOVERY_COMPLETION_THRESHOLD = 0.99;
+    private static final int MAX_REQUESTS_PER_SECOND = 100_000;
+    private static final int MAX_MESSAGES_PER_GROUP_PER_SECOND = 10_000;
 
     private final RateLimiter topicRateLimiter;
     private final Cache<String, RateLimiter> groupRateLimiters;
@@ -89,11 +94,13 @@ public class SnsRateLimiter implements DisposableBean {
         this.blockingScheduler = blockingScheduler;
 
         if (enabled) {
-            if (requestsPerSecond <= 0) {
-                throw new IllegalArgumentException("requestsPerSecond must be positive, got: " + requestsPerSecond);
+            if (requestsPerSecond <= 0 || requestsPerSecond > MAX_REQUESTS_PER_SECOND) {
+                throw new IllegalArgumentException(
+                        "requestsPerSecond must be between 1 and " + MAX_REQUESTS_PER_SECOND + ", got: " + requestsPerSecond);
             }
-            if (messagesPerGroupPerSecond <= 0) {
-                throw new IllegalArgumentException("messagesPerGroupPerSecond must be positive, got: " + messagesPerGroupPerSecond);
+            if (messagesPerGroupPerSecond <= 0 || messagesPerGroupPerSecond > MAX_MESSAGES_PER_GROUP_PER_SECOND) {
+                throw new IllegalArgumentException(
+                        "messagesPerGroupPerSecond must be between 1 and " + MAX_MESSAGES_PER_GROUP_PER_SECOND + ", got: " + messagesPerGroupPerSecond);
             }
             if (warmupPeriod == null) {
                 throw new IllegalArgumentException("warmupPeriod cannot be null");
@@ -163,25 +170,13 @@ public class SnsRateLimiter implements DisposableBean {
 
         consecutiveSuccesses.set(0);
 
-        // Reduce topic rate atomically using compareAndSet loop
-        // Note: Must use Double objects (not primitives) to preserve reference equality for CAS
-        Double oldFactor;
-        Double newFactor;
-        do {
-            oldFactor = currentRateFactor.get();
-            newFactor = Math.max(oldFactor * THROTTLE_REDUCTION_FACTOR, MIN_RATE_FACTOR);
-            if (newFactor >= oldFactor) {
-                // Already at or below the new factor, no update needed
-                break;
-            }
-        } while (!currentRateFactor.compareAndSet(oldFactor, newFactor));
+        double newFactor = updateRateFactor(
+                old -> Math.max(old * THROTTLE_REDUCTION_FACTOR, MIN_RATE_FACTOR));
 
-        if (newFactor < oldFactor) {
-            double newRate = requestsPerSecond * newFactor;
-            topicRateLimiter.setRate(newRate);
-            log.warn("Throttling detected - reducing topic rate to {}/sec ({}% of configured)",
-                    Math.round(newRate * 10) / 10.0, Math.round(newFactor * 100));
-        }
+        double newRate = requestsPerSecond * newFactor;
+        topicRateLimiter.setRate(newRate);
+        log.warn("Throttling detected - topic rate now {}/sec ({}% of configured)",
+                Math.round(newRate * 10) / 10.0, Math.round(newFactor * 100));
 
         // Also reduce group rate if specified
         if (messageGroupId != null) {
@@ -209,52 +204,39 @@ public class SnsRateLimiter implements DisposableBean {
             return;
         }
 
-        // Recover after 10 consecutive successes
-        if (consecutiveSuccesses.incrementAndGet() >= 10) {
-            consecutiveSuccesses.set(0);
+        // Recover after enough consecutive successes; CAS ensures only one thread enters recovery
+        int current = consecutiveSuccesses.incrementAndGet();
+        if (current >= CONSECUTIVE_SUCCESSES_FOR_RECOVERY
+                && consecutiveSuccesses.compareAndSet(current, 0)) {
 
-            // Increase rate atomically using compareAndSet loop
-            // Note: Must use Double objects (not primitives) to preserve reference equality for CAS
-            Double oldFactor;
-            Double newFactor;
-            do {
-                oldFactor = currentRateFactor.get();
-                newFactor = Math.min(oldFactor * RECOVERY_INCREASE_FACTOR, 1.0);
-                if (newFactor <= oldFactor) {
-                    // Already at or above the new factor, no update needed
-                    break;
-                }
-            } while (!currentRateFactor.compareAndSet(oldFactor, newFactor));
+            double newFactor = updateRateFactor(
+                    old -> Math.min(old * RECOVERY_INCREASE_FACTOR, 1.0));
 
-            if (newFactor > oldFactor) {
-                double newRate = requestsPerSecond * newFactor;
-                topicRateLimiter.setRate(newRate);
-                log.info("Recovering topic rate to {}/sec ({}% of configured)",
-                        Math.round(newRate * 10) / 10.0, Math.round(newFactor * 100));
-            }
+            double newRate = requestsPerSecond * newFactor;
+            topicRateLimiter.setRate(newRate);
+            log.info("Recovering topic rate to {}/sec ({}% of configured)",
+                    Math.round(newRate * 10) / 10.0, Math.round(newFactor * 100));
 
             // Also recover throttled groups
-            if (!throttledGroups.isEmpty()) {
-                for (String groupId : throttledGroups) {
-                    RateLimiter groupLimiter = groupRateLimiters.getIfPresent(groupId);
-                    if (groupLimiter != null) {
-                        double currentRate = groupLimiter.getRate();
-                        double targetRate = messagesPerGroupPerSecond * currentRateFactor.get();
-                        if (currentRate < targetRate) {
-                            double newGroupRate = Math.min(currentRate * RECOVERY_INCREASE_FACTOR, targetRate);
-                            groupLimiter.setRate(newGroupRate);
-                            log.debug("Recovering rate for group '{}' to {}/sec", groupId, Math.round(newGroupRate * 10) / 10.0);
-                            // Check removal using the updated rate
-                            if (newGroupRate >= targetRate * 0.99) {
-                                throttledGroups.remove(groupId);
-                            }
-                        } else {
-                            // Already at or above target, remove from throttled set
-                            throttledGroups.remove(groupId);
-                        }
-                    } else {
-                        throttledGroups.remove(groupId);
-                    }
+            var iterator = throttledGroups.iterator();
+            while (iterator.hasNext()) {
+                String groupId = iterator.next();
+                RateLimiter groupLimiter = groupRateLimiters.getIfPresent(groupId);
+                if (groupLimiter == null) {
+                    iterator.remove();
+                    continue;
+                }
+
+                double currentRate = groupLimiter.getRate();
+                double targetRate = messagesPerGroupPerSecond * newFactor;
+                if (currentRate < targetRate) {
+                    double newGroupRate = Math.min(currentRate * RECOVERY_INCREASE_FACTOR, targetRate);
+                    groupLimiter.setRate(newGroupRate);
+                    log.debug("Recovering rate for group '{}' to {}/sec", groupId, Math.round(newGroupRate * 10) / 10.0);
+                }
+
+                if (currentRate >= targetRate * RECOVERY_COMPLETION_THRESHOLD) {
+                    iterator.remove();
                 }
             }
         }
@@ -283,10 +265,28 @@ public class SnsRateLimiter implements DisposableBean {
      */
     @Override
     public void destroy() {
-        if (enabled && blockingScheduler != null) {
+        if (blockingScheduler != null) {
             blockingScheduler.dispose();
             log.info("Rate limiter scheduler disposed");
         }
+    }
+
+    /**
+     * Atomically updates the rate factor using a CAS loop and returns the resulting value.
+     * The update function computes the new factor from the old; if the result equals the old
+     * value, no update is performed.
+     */
+    private double updateRateFactor(DoubleUnaryOperator updateFn) {
+        Double oldFactor;
+        Double newFactor;
+        do {
+            oldFactor = currentRateFactor.get();
+            newFactor = updateFn.applyAsDouble(oldFactor);
+            if (Double.compare(newFactor, oldFactor) == 0) {
+                return oldFactor;
+            }
+        } while (!currentRateFactor.compareAndSet(oldFactor, newFactor));
+        return newFactor;
     }
 
     private static RateLimiter createRateLimiter(int permitsPerSecond, Duration warmupPeriod) {

@@ -4,8 +4,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -296,7 +294,7 @@ class SnsRateLimiterTest {
         blockingScheduler = Schedulers.newBoundedElastic(4, 100, "test-rate-limit");
 
         // High limits to avoid rate limiting
-        SnsRateLimiter limiter = new SnsRateLimiter(100000, 100000, Duration.ZERO, blockingScheduler);
+        SnsRateLimiter limiter = new SnsRateLimiter(100_000, 10_000, Duration.ZERO, blockingScheduler);
 
         // Create limiters for many groups (more than the 10K cache limit)
         // This shouldn't cause OOM due to LRU eviction

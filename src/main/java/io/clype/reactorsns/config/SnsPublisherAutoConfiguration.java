@@ -58,6 +58,10 @@ import software.amazon.awssdk.services.sns.SnsAsyncClient;
 @ConditionalOnProperty(prefix = "sns.publisher", name = "topic-arn")
 public class SnsPublisherAutoConfiguration {
 
+    private static final Duration CONNECTION_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration CONNECTION_MAX_IDLE_TIME = Duration.ofSeconds(60);
+    private static final int RATE_LIMIT_QUEUE_MULTIPLIER = 250;
+
     private final SnsPublisherProperties properties;
 
     /**
@@ -83,8 +87,8 @@ public class SnsPublisherAutoConfiguration {
     public SdkAsyncHttpClient awsCrtHttpClient() {
         return AwsCrtAsyncHttpClient.builder()
                 .maxConcurrency(properties.getMaxConnections())
-                .connectionTimeout(Duration.ofSeconds(10))
-                .connectionMaxIdleTime(Duration.ofSeconds(60))
+                .connectionTimeout(CONNECTION_TIMEOUT)
+                .connectionMaxIdleTime(CONNECTION_MAX_IDLE_TIME)
                 .build();
     }
 
@@ -115,7 +119,7 @@ public class SnsPublisherAutoConfiguration {
                 .httpClient(httpClient)
                 .overrideConfiguration(overrideConfig);
 
-        if (properties.getRegion() != null && !properties.getRegion().isEmpty()) {
+        if (properties.getRegion() != null && !properties.getRegion().isBlank()) {
             builder.region(Region.of(properties.getRegion()));
         }
 
@@ -137,7 +141,7 @@ public class SnsPublisherAutoConfiguration {
         var config = properties.getRateLimit();
         var blockingScheduler = Schedulers.newBoundedElastic(
                 config.getThreadPoolSize(),
-                config.getThreadPoolSize() * 250,
+                config.getThreadPoolSize() * RATE_LIMIT_QUEUE_MULTIPLIER,
                 "rate-limit");
         return new SnsRateLimiter(
                 config.getRequestsPerSecond(),

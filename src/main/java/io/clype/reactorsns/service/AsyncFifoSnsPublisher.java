@@ -10,6 +10,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Pattern;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 import javax.net.ssl.SSLException;
@@ -18,6 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
 
+import io.clype.reactorsns.config.SnsPublisherProperties;
 import io.clype.reactorsns.metrics.SnsPublisherMetrics;
 import io.clype.reactorsns.model.FailedEntry;
 import io.clype.reactorsns.model.FifoOrderingViolationException;
@@ -35,6 +37,7 @@ import reactor.core.scheduler.Schedulers;
 import reactor.util.retry.Retry;
 
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
+import software.amazon.awssdk.services.sns.model.BatchResultErrorEntry;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequest;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequestEntry;
 import software.amazon.awssdk.services.sns.model.PublishBatchResponse;
@@ -132,8 +135,8 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     /** Jitter factor for retry backoff (0.5 = 50% randomization). */
     private static final double RETRY_JITTER = 0.5;
 
-    /** AWS error codes that indicate throttling (rate limiting). */
-    private static final Set<String> THROTTLING_ERROR_CODES = Set.of("Throttling");
+    /** AWS error code that indicates throttling (rate limiting). */
+    private static final String THROTTLING_ERROR_CODE = "Throttling";
 
     /** AWS error codes that indicate transient failures eligible for retry. */
     private static final Set<String> RETRYABLE_ERROR_CODES = Set.of(
@@ -163,6 +166,18 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
 
     /** Maximum per-partition buffer size. */
     private static final int MAX_PARTITION_BUFFER_SIZE = 10_000;
+
+    /** Headroom multiplier for queue capacity to accommodate in-flight work during processing. */
+    private static final int QUEUE_HEADROOM_FACTOR = 2;
+
+    /** Maximum bit-shift for exponential backoff to prevent overflow. */
+    private static final int MAX_BACKOFF_EXPONENT = 10;
+
+    /** UTF-8 boundary: characters below this value are single-byte ASCII. */
+    private static final int UTF8_TWO_BYTE_THRESHOLD = 0x80;
+
+    /** UTF-8 boundary: characters below this value are two-byte encoded. */
+    private static final int UTF8_THREE_BYTE_THRESHOLD = 0x800;
 
     // ==========================================================================
     // Fields
@@ -197,7 +212,10 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      */
     public AsyncFifoSnsPublisher(SnsAsyncClient snsClient, String topicArn,
                                   int partitionCount, Duration batchTimeout) {
-        this(snsClient, topicArn, partitionCount, batchTimeout, 10_000, 100, DEFAULT_MAX_CONNECTIONS, null,
+        this(snsClient, topicArn, partitionCount, batchTimeout,
+                SnsPublisherProperties.DEFAULT_BUFFER_SIZE,
+                SnsPublisherProperties.DEFAULT_PARTITION_BUFFER_SIZE,
+                DEFAULT_MAX_CONNECTIONS, null,
                 SnsRateLimiter.disabled());
     }
 
@@ -328,7 +346,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         int threadPoolSize = Math.min(partitionCount, maxConnections);
         // Queue cap prevents unbounded memory growth; sized for all partitions with their buffers
         // Factor of 2 provides headroom for in-flight work during processing
-        int queueCap = partitionCount * partitionBufferSize * 2;
+        int queueCap = partitionCount * partitionBufferSize * QUEUE_HEADROOM_FACTOR;
         this.ioScheduler = Schedulers.newBoundedElastic(threadPoolSize, queueCap, "sns-publisher-io");
     }
 
@@ -579,20 +597,18 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      * is gated by the rate limiter, preventing retry bursts from bypassing configured limits.</p>
      */
     private Mono<PublishBatchResponse> publishBatch(List<SnsEvent> batch, String messageGroupId, int messageCount) {
-        if (batch.isEmpty()) {
-            return Mono.empty();
-        }
-
         PublishBatchRequest request = buildBatchRequest(batch);
 
         return Mono.defer(() -> rateLimiter.acquirePermit(messageGroupId, messageCount)
                         .then(Mono.fromFuture(() -> snsClient.publishBatch(request))))
                 .flatMap(response -> handleBatchResponse(response, batch))
-                .doOnError(e -> notifyRateLimiterOnThrottle(e, messageGroupId))
                 .retryWhen(createRetrySpec(messageGroupId))
                 .doOnSuccess(response -> rateLimiter.onSuccess())
-                .doOnError(e -> log.error("Failed to publish batch after retries: {}",
-                        sanitizeForLog(e.getMessage())));
+                .doOnError(e -> {
+                    notifyRateLimiterOnThrottle(e, messageGroupId);
+                    log.error("Failed to publish batch after retries: {}",
+                            sanitizeForLog(e.getMessage()));
+                });
     }
 
     /**
@@ -610,10 +626,10 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     private boolean isThrottlingException(Throwable throwable) {
         if (throwable instanceof PartialBatchFailureException partialEx) {
             return partialEx.getFailedEntries().stream()
-                    .anyMatch(entry -> THROTTLING_ERROR_CODES.contains(entry.code()));
+                    .anyMatch(entry -> THROTTLING_ERROR_CODE.equals(entry.code()));
         }
         if (throwable instanceof SnsException snsEx && snsEx.awsErrorDetails() != null) {
-            return THROTTLING_ERROR_CODES.contains(snsEx.awsErrorDetails().errorCode());
+            return THROTTLING_ERROR_CODE.equals(snsEx.awsErrorDetails().errorCode());
         }
         return false;
     }
@@ -661,7 +677,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
                 response.failed().size(),
                 batchSize,
                 sanitizeForLog(response.failed().stream()
-                        .map(e -> e.id())
+                        .map(BatchResultErrorEntry::id)
                         .collect(Collectors.joining(", "))));
 
         List<FailedEntry> failedEntries = response.failed().stream()
@@ -793,9 +809,9 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
             }
 
             // Calculate backoff with exponential growth and jitter
-            long baseBackoffMs = RETRY_MIN_BACKOFF.toMillis() * (1L << Math.min(attempt - 1, 10));
+            long baseBackoffMs = RETRY_MIN_BACKOFF.toMillis() * (1L << Math.min(attempt - 1, MAX_BACKOFF_EXPONENT));
             long cappedBackoffMs = Math.min(baseBackoffMs, maxBackoff.toMillis());
-            double jitter = 1.0 + (Math.random() - 0.5) * RETRY_JITTER;
+            double jitter = 1.0 + (ThreadLocalRandom.current().nextDouble() - 0.5) * RETRY_JITTER;
             long actualBackoffMs = (long) (cappedBackoffMs * jitter);
 
             String retryType = isThrottling ? "throttling" : "transient";
@@ -867,7 +883,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         // Fast-path: scan for non-ASCII; if all ASCII, return length directly
         boolean allAscii = true;
         for (int i = 0; i < len; i++) {
-            if (str.charAt(i) >= 0x80) {
+            if (str.charAt(i) >= UTF8_TWO_BYTE_THRESHOLD) {
                 allAscii = false;
                 break;
             }
@@ -881,9 +897,9 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         int size = 0;
         for (int i = 0; i < len; i++) {
             char c = str.charAt(i);
-            if (c < 0x80) {
+            if (c < UTF8_TWO_BYTE_THRESHOLD) {
                 size += 1;  // ASCII: 1 byte
-            } else if (c < 0x800) {
+            } else if (c < UTF8_THREE_BYTE_THRESHOLD) {
                 size += 2;  // 2-byte UTF-8
             } else {
                 size += 3;  // 3-byte UTF-8 (covers BMP, surrogate pairs handled implicitly)
