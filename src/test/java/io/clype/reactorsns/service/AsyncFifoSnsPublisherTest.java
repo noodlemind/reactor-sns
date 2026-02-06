@@ -6,6 +6,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -16,21 +18,28 @@ import org.mockito.ArgumentCaptor;
 import io.clype.reactorsns.model.FifoOrderingViolationException;
 import io.clype.reactorsns.model.PartialBatchFailureException;
 import io.clype.reactorsns.model.SnsEvent;
+import io.clype.reactorsns.ratelimit.SnsRateLimiter;
 
 import reactor.core.Exceptions;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.test.StepVerifier;
 
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
+import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
 import software.amazon.awssdk.services.sns.model.BatchResultErrorEntry;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequest;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequestEntry;
 import software.amazon.awssdk.services.sns.model.PublishBatchResponse;
 import software.amazon.awssdk.services.sns.model.PublishBatchResultEntry;
+import software.amazon.awssdk.services.sns.model.SnsException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -222,6 +231,74 @@ class AsyncFifoSnsPublisherTest {
     }
 
     @Test
+    void testPartialBatchFailureWithThrottlingExceptionCodeIsRetried() {
+        AtomicInteger attemptNumber = new AtomicInteger(0);
+
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+            .thenAnswer(invocation -> {
+                if (attemptNumber.incrementAndGet() == 1) {
+                    return CompletableFuture.completedFuture(
+                        PublishBatchResponse.builder()
+                            .failed(List.of(
+                                BatchResultErrorEntry.builder()
+                                    .id("dedup-0-0")
+                                    .code("ThrottlingException")
+                                    .message("Rate exceeded for this operation")
+                                    .senderFault(false)
+                                    .build()))
+                            .build());
+                }
+                return CompletableFuture.completedFuture(
+                    PublishBatchResponse.builder()
+                        .successful(List.of(
+                            PublishBatchResultEntry.builder().id("dedup-0-0").build()))
+                        .build());
+            });
+
+        List<SnsEvent> events = List.of(new SnsEvent("group1", "dedup-0", "payload-0"));
+
+        StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events)))
+            .expectNextCount(1)
+            .verifyComplete();
+
+        verify(snsClient, times(2)).publishBatch(any(PublishBatchRequest.class));
+    }
+
+    @Test
+    void testSnsExceptionWithRateExceededHttp400IsRetried() {
+        AtomicInteger attemptNumber = new AtomicInteger(0);
+
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+            .thenAnswer(invocation -> {
+                if (attemptNumber.incrementAndGet() == 1) {
+                    CompletableFuture<PublishBatchResponse> failed = new CompletableFuture<>();
+                    failed.completeExceptionally(SnsException.builder()
+                            .statusCode(400)
+                            .awsErrorDetails(AwsErrorDetails.builder()
+                                    .errorCode("ThrottlingException")
+                                    .errorMessage("Rate exceeded")
+                                    .build())
+                            .message("Rate exceeded")
+                            .build());
+                    return failed;
+                }
+                return CompletableFuture.completedFuture(
+                        PublishBatchResponse.builder()
+                                .successful(List.of(
+                                        PublishBatchResultEntry.builder().id("dedup-0-0").build()))
+                                .build());
+            });
+
+        List<SnsEvent> events = List.of(new SnsEvent("group1", "dedup-0", "payload-0"));
+
+        StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events)))
+                .expectNextCount(1)
+                .verifyComplete();
+
+        verify(snsClient, times(2)).publishBatch(any(PublishBatchRequest.class));
+    }
+
+    @Test
     void testPartialBatchFailureWithServiceUnavailableIsRetried() {
         AtomicInteger attemptNumber = new AtomicInteger(0);
 
@@ -315,15 +392,16 @@ class AsyncFifoSnsPublisherTest {
 
     @Test
     void testRetryExhaustionAfterMaxAttempts() {
-        // Always return throttling error (senderFault=false)
+        // Use ServiceUnavailable (non-throttling retryable error) to test basic retry exhaustion.
+        // Throttling errors have a much higher retry limit (20) with longer backoffs.
         when(snsClient.publishBatch(any(PublishBatchRequest.class)))
             .thenAnswer(invocation -> CompletableFuture.completedFuture(
                 PublishBatchResponse.builder()
                     .failed(List.of(
                         BatchResultErrorEntry.builder()
                             .id("dedup-0-0")
-                            .code("Throttling")
-                            .message("Rate exceeded")
+                            .code("ServiceUnavailable")
+                            .message("Service temporarily unavailable")
                             .senderFault(false)
                             .build()))
                     .build()));
@@ -337,7 +415,7 @@ class AsyncFifoSnsPublisherTest {
                 e.getCause() instanceof PartialBatchFailureException)
             .verify(Duration.ofSeconds(30));
 
-        // 1 initial + 3 retries (MAX_RETRIES) = 4 total calls
+        // 1 initial + 3 retries (MAX_RETRIES for non-throttling) = 4 total calls
         verify(snsClient, times(4)).publishBatch(any(PublishBatchRequest.class));
     }
 
@@ -515,18 +593,19 @@ class AsyncFifoSnsPublisherTest {
 
     @Test
     void testDifferentGroupsContinueWhenOneGroupFails() {
-        // Scenario: Group A fails, but Groups B and C should still be processed
-        // This verifies independent processing across different messageGroupIds
-        AtomicInteger callCount = new AtomicInteger(0);
+        // Scenario: Group A fails, but Groups B and C should still be processed.
+        // Use a latch so Group A's failure only returns after B and C have completed,
+        // ensuring both successes are emitted before the error propagates.
+        CountDownLatch successGroupsDone = new CountDownLatch(2);
 
         when(snsClient.publishBatch(any(PublishBatchRequest.class)))
             .thenAnswer(invocation -> {
                 PublishBatchRequest req = invocation.getArgument(0);
                 String groupId = req.publishBatchRequestEntries().get(0).messageGroupId();
-                callCount.incrementAndGet();
 
                 if ("Loan-A".equals(groupId)) {
-                    // Group A fails with sender fault (non-retryable)
+                    // Wait for B and C to complete before returning the failure
+                    successGroupsDone.await(5, TimeUnit.SECONDS);
                     return CompletableFuture.completedFuture(
                         PublishBatchResponse.builder()
                             .failed(List.of(
@@ -542,6 +621,7 @@ class AsyncFifoSnsPublisherTest {
                 List<PublishBatchResultEntry> results = req.publishBatchRequestEntries().stream()
                     .map(e -> PublishBatchResultEntry.builder().id(e.id()).build())
                     .collect(Collectors.toList());
+                successGroupsDone.countDown();
                 return CompletableFuture.completedFuture(
                     PublishBatchResponse.builder().successful(results).build());
             });
@@ -552,16 +632,10 @@ class AsyncFifoSnsPublisherTest {
             new SnsEvent("Loan-C", "dedup-C1", "payload-C1")
         );
 
-        // With flatMap, successful groups emit their responses before the failed group errors
-        // Expect 2 successes (B and C) then an error (A)
         StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events)))
-            .expectNextCount(2)  // B and C succeed
-            .expectError(PartialBatchFailureException.class)  // A fails
+            .expectNextCount(2)  // B and C succeed before A's error
+            .expectError(PartialBatchFailureException.class)
             .verify();
-
-        // All three groups should have been attempted (processed in parallel)
-        assertEquals(3, callCount.get(),
-            "All three groups (A, B, C) should be attempted independently");
     }
 
     // ==========================================================================
@@ -639,5 +713,140 @@ class AsyncFifoSnsPublisherTest {
 
         assertThrows(NullPointerException.class, () ->
             publisher.publishEvents(null, x -> new SnsEvent("g", "d", "p")));
+    }
+
+    // ==========================================================================
+    // Rate Limiting Integration Tests
+    // ==========================================================================
+
+    @Test
+    void publisherWithRateLimiterEnforcesRateLimit() {
+        // Create a rate limiter with low limits for testing
+        Scheduler rateLimitScheduler = Schedulers.newBoundedElastic(4, 100, "rate-limit-test");
+        SnsRateLimiter rateLimiter = new SnsRateLimiter(10, 100, Duration.ZERO, rateLimitScheduler);
+
+        AsyncFifoSnsPublisher rateLimitedPublisher = new AsyncFifoSnsPublisher(
+                snsClient, TOPIC_ARN, 10, Duration.ofMillis(50),
+                10_000, 100, 100, null, rateLimiter);
+
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+            .thenAnswer(invocation -> {
+                PublishBatchRequest req = invocation.getArgument(0);
+                List<PublishBatchResultEntry> results = req.publishBatchRequestEntries().stream()
+                    .map(e -> PublishBatchResultEntry.builder().id(e.id()).build())
+                    .collect(Collectors.toList());
+                return CompletableFuture.completedFuture(
+                    PublishBatchResponse.builder().successful(results).build());
+            });
+
+        // 15 events = 2 batches (10 + 5) at 10 requests/sec should take ~100ms
+        List<SnsEvent> events = new ArrayList<>();
+        for (int i = 0; i < 15; i++) {
+            events.add(new SnsEvent("group1", "dedup-" + i, "payload-" + i));
+        }
+
+        long start = System.nanoTime();
+        StepVerifier.create(rateLimitedPublisher.publishEvents(Flux.fromIterable(events)))
+            .expectNextCount(2)
+            .verifyComplete();
+        long elapsed = System.nanoTime() - start;
+
+        // Should take at least 50ms due to rate limiting (2 batches at 10/sec = 100ms theoretically)
+        // Using a lower bound to account for timing variations
+        long elapsedMs = Duration.ofNanos(elapsed).toMillis();
+        if (elapsedMs < 50) {
+            throw new AssertionError("Rate limiter should slow down publishing, took " + elapsedMs + "ms");
+        }
+
+        rateLimitedPublisher.destroy();
+        rateLimitScheduler.dispose();
+    }
+
+    @Test
+    void publisherWithDisabledRateLimiterDoesNotBlock() {
+        AsyncFifoSnsPublisher noLimitPublisher = new AsyncFifoSnsPublisher(
+                snsClient, TOPIC_ARN, 10, Duration.ofMillis(50),
+                10_000, 100, 100, null, SnsRateLimiter.disabled());
+
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+            .thenAnswer(invocation -> {
+                PublishBatchRequest req = invocation.getArgument(0);
+                List<PublishBatchResultEntry> results = req.publishBatchRequestEntries().stream()
+                    .map(e -> PublishBatchResultEntry.builder().id(e.id()).build())
+                    .collect(Collectors.toList());
+                return CompletableFuture.completedFuture(
+                    PublishBatchResponse.builder().successful(results).build());
+            });
+
+        List<SnsEvent> events = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            events.add(new SnsEvent("group1", "dedup-" + i, "payload-" + i));
+        }
+
+        long start = System.nanoTime();
+        StepVerifier.create(noLimitPublisher.publishEvents(Flux.fromIterable(events)))
+            .expectNextCount(2)
+            .verifyComplete();
+        long elapsed = System.nanoTime() - start;
+
+        // With no rate limiting, should complete in under 1 second (just batching delay)
+        long elapsedMs = Duration.ofNanos(elapsed).toMillis();
+        if (elapsedMs >= 1000) {
+            throw new AssertionError("Disabled rate limiter should not add delay, took " + elapsedMs + "ms");
+        }
+
+        noLimitPublisher.destroy();
+    }
+
+    @Test
+    void rateLimiterNullCheckInConstructor() {
+        assertThrows(NullPointerException.class, () ->
+            new AsyncFifoSnsPublisher(snsClient, TOPIC_ARN, 10, Duration.ofMillis(50),
+                10_000, 100, 100, null, null),
+            "rateLimiter cannot be null");
+    }
+
+    @Test
+    void throttledRetriesNotifyRateLimiterForEachAttempt() {
+        SnsRateLimiter rateLimiter = mock(SnsRateLimiter.class);
+        when(rateLimiter.acquirePermit(anyString(), anyInt())).thenReturn(reactor.core.publisher.Mono.empty());
+
+        AsyncFifoSnsPublisher rateLimitedPublisher = new AsyncFifoSnsPublisher(
+                snsClient, TOPIC_ARN, 10, Duration.ofMillis(10),
+                10_000, 100, 100, null, rateLimiter);
+
+        AtomicInteger attemptNumber = new AtomicInteger(0);
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+                .thenAnswer(invocation -> {
+                    int attempt = attemptNumber.incrementAndGet();
+                    if (attempt <= 2) {
+                        return CompletableFuture.completedFuture(
+                                PublishBatchResponse.builder()
+                                        .failed(List.of(
+                                                BatchResultErrorEntry.builder()
+                                                        .id("dedup-0-0")
+                                                        .code("ThrottlingException")
+                                                        .message("Rate exceeded")
+                                                        .senderFault(false)
+                                                        .build()))
+                                        .build());
+                    }
+                    return CompletableFuture.completedFuture(
+                            PublishBatchResponse.builder()
+                                    .successful(List.of(
+                                            PublishBatchResultEntry.builder().id("dedup-0-0").build()))
+                                    .build());
+                });
+
+        List<SnsEvent> events = List.of(new SnsEvent("group1", "dedup-0", "payload-0"));
+
+        StepVerifier.create(rateLimitedPublisher.publishEvents(Flux.fromIterable(events)))
+                .expectNextCount(1)
+                .verifyComplete();
+
+        verify(rateLimiter, times(2)).onThrottle("group1");
+        verify(rateLimiter, times(1)).onSuccess();
+
+        rateLimitedPublisher.destroy();
     }
 }

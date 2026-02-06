@@ -125,6 +125,13 @@
       <optional>true</optional>
     </dependency>
 
+    <!-- Rate limiting -->
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>33.4.8-jre</version>
+    </dependency>
+
     <!-- Testing -->
     <dependency>
       <groupId>org.junit.jupiter</groupId>

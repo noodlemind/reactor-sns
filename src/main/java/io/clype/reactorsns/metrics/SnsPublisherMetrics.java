@@ -32,6 +32,7 @@ import io.micrometer.core.instrument.Timer;
 public class SnsPublisherMetrics {
 
     private static final String METRIC_PREFIX = "sns.publisher";
+    private static final double[] PUBLISH_LATENCY_PERCENTILES = {0.5, 0.95, 0.99};
 
     private final Counter batchesCompleted;
     private final Counter batchesFailed;
@@ -74,7 +75,7 @@ public class SnsPublisherMetrics {
         this.publishLatency = Timer.builder(METRIC_PREFIX + ".publish.latency")
                 .description("Time taken to publish a batch to SNS")
                 .tags(tags)
-                .publishPercentiles(0.5, 0.95, 0.99)
+                .publishPercentiles(PUBLISH_LATENCY_PERCENTILES)
                 .register(registry);
 
         this.activeRequests = new AtomicInteger(0);
