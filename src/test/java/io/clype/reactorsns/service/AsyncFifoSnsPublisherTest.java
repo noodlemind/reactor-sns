@@ -33,6 +33,7 @@ import software.amazon.awssdk.services.sns.model.PublishBatchResultEntry;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
@@ -556,13 +557,18 @@ class AsyncFifoSnsPublisherTest {
             new SnsEvent("Loan-C", "dedup-C1", "payload-C1")
         );
 
-        // With flatMap, successful groups emit their responses before the failed group errors
-        // Expect 2 successes (B and C) then an error (A)
-        StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events)))
-            .expectNextCount(2)  // B and C succeed
-            .expectError(PartialBatchFailureException.class)  // A fails
+        // With flatMap, groups are processed in parallel. The error from Group A may
+        // propagate before both B and C complete, so we cannot assert an exact success count.
+        AtomicInteger successCount = new AtomicInteger(0);
+
+        StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events))
+                        .doOnNext(r -> successCount.incrementAndGet()))
+            .thenConsumeWhile(r -> true)
+            .expectError(PartialBatchFailureException.class)
             .verify();
 
+        assertTrue(successCount.get() >= 1 && successCount.get() <= 2,
+            "Expected 1-2 successful groups, got " + successCount.get());
         // All three groups should have been attempted (processed in parallel)
         assertEquals(3, callCount.get(),
             "All three groups (A, B, C) should be attempted independently");
