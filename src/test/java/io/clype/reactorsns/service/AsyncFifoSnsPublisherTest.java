@@ -6,6 +6,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -35,7 +37,6 @@ import software.amazon.awssdk.services.sns.model.SnsException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -592,18 +593,19 @@ class AsyncFifoSnsPublisherTest {
 
     @Test
     void testDifferentGroupsContinueWhenOneGroupFails() {
-        // Scenario: Group A fails, but Groups B and C should still be processed
-        // This verifies independent processing across different messageGroupIds
-        AtomicInteger callCount = new AtomicInteger(0);
+        // Scenario: Group A fails, but Groups B and C should still be processed.
+        // Use a latch so Group A's failure only returns after B and C have completed,
+        // ensuring both successes are emitted before the error propagates.
+        CountDownLatch successGroupsDone = new CountDownLatch(2);
 
         when(snsClient.publishBatch(any(PublishBatchRequest.class)))
             .thenAnswer(invocation -> {
                 PublishBatchRequest req = invocation.getArgument(0);
                 String groupId = req.publishBatchRequestEntries().get(0).messageGroupId();
-                callCount.incrementAndGet();
 
                 if ("Loan-A".equals(groupId)) {
-                    // Group A fails with sender fault (non-retryable)
+                    // Wait for B and C to complete before returning the failure
+                    successGroupsDone.await(5, TimeUnit.SECONDS);
                     return CompletableFuture.completedFuture(
                         PublishBatchResponse.builder()
                             .failed(List.of(
@@ -619,6 +621,7 @@ class AsyncFifoSnsPublisherTest {
                 List<PublishBatchResultEntry> results = req.publishBatchRequestEntries().stream()
                     .map(e -> PublishBatchResultEntry.builder().id(e.id()).build())
                     .collect(Collectors.toList());
+                successGroupsDone.countDown();
                 return CompletableFuture.completedFuture(
                     PublishBatchResponse.builder().successful(results).build());
             });
@@ -629,22 +632,10 @@ class AsyncFifoSnsPublisherTest {
             new SnsEvent("Loan-C", "dedup-C1", "payload-C1")
         );
 
-        // With flatMap, groups are processed in parallel. The error from Group A may
-        // propagate before both B and C complete, so we cannot assert an exact success count.
-        AtomicInteger successCount = new AtomicInteger(0);
-
-        StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events))
-                        .doOnNext(r -> successCount.incrementAndGet()))
-            .thenConsumeWhile(r -> true)
+        StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events)))
+            .expectNextCount(2)  // B and C succeed before A's error
             .expectError(PartialBatchFailureException.class)
             .verify();
-
-        assertTrue(successCount.get() >= 1 && successCount.get() <= 2,
-            "Expected 1-2 successful groups, got " + successCount.get());
-        // flatMap cancels remaining subscriptions on error, so not all groups
-        // may be attempted. At minimum, the failing group + 1 success must occur.
-        assertTrue(callCount.get() >= 2 && callCount.get() <= 3,
-            "Expected 2-3 groups attempted, got " + callCount.get());
     }
 
     // ==========================================================================
