@@ -1,8 +1,11 @@
 package io.clype.reactorsns.ratelimit;
 
+import java.lang.reflect.Field;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -278,6 +281,53 @@ class SnsRateLimiterTest {
     }
 
     @Test
+    void recoveredGroupsAreRemovedFromThrottleTracking() throws Exception {
+        blockingScheduler = Schedulers.newBoundedElastic(4, 100, "test-rate-limit");
+        SnsRateLimiter limiter = new SnsRateLimiter(1000, 100, Duration.ZERO, blockingScheduler);
+
+        // Ensure the per-group limiter exists so onThrottle can actually reduce it.
+        StepVerifier.create(limiter.acquirePermit("group1", 1))
+                .verifyComplete();
+
+        limiter.onThrottle("group1");
+        assertEquals(1, throttledGroupCount(limiter));
+
+        // Recover to full factor; this should clear the tracked group.
+        for (int i = 0; i < 100; i++) {
+            limiter.onSuccess();
+        }
+
+        assertEquals(1.0, limiter.getCurrentRateFactor(), 0.01);
+        assertEquals(0, throttledGroupCount(limiter),
+                "Recovered groups should be removed from throttle tracking");
+    }
+
+    @Test
+    void hotGroupWaitDoesNotReserveTopicPermit() throws Exception {
+        blockingScheduler = Schedulers.newBoundedElastic(4, 100, "test-rate-limit");
+        SnsRateLimiter limiter = new SnsRateLimiter(2, 1, Duration.ZERO, blockingScheduler);
+
+        // Warm up and consume an initial permit for both topic and hot-group limiters.
+        StepVerifier.create(limiter.acquirePermit("hot-group", 1))
+                .verifyComplete();
+
+        // This request should now block on hot-group permits.
+        CompletableFuture<Void> hotGroupAcquire = limiter.acquirePermit("hot-group", 1).toFuture();
+        Thread.sleep(50);
+
+        // Cold group should still progress without waiting for hot-group's group-level delay.
+        long coldStart = System.nanoTime();
+        StepVerifier.create(limiter.acquirePermit("cold-group", 1))
+                .verifyComplete();
+        long coldWaitMs = Duration.ofNanos(System.nanoTime() - coldStart).toMillis();
+
+        assertTrue(coldWaitMs < 700,
+                "Cold group should not wait behind hot-group group backpressure, took " + coldWaitMs + "ms");
+
+        hotGroupAcquire.get(5, TimeUnit.SECONDS);
+    }
+
+    @Test
     void disabledLimiterIgnoresThrottleAndSuccess() {
         SnsRateLimiter limiter = SnsRateLimiter.disabled();
 
@@ -394,4 +444,12 @@ class SnsRateLimiterTest {
         assertTrue(finalFactor >= 0.1 && finalFactor <= 1.0,
                 "Final rate factor should be within bounds: " + finalFactor);
     }
+
+    @SuppressWarnings("unchecked")
+    private static int throttledGroupCount(SnsRateLimiter limiter) throws Exception {
+        Field field = SnsRateLimiter.class.getDeclaredField("throttledGroups");
+        field.setAccessible(true);
+        return ((Set<String>) field.get(limiter)).size();
+    }
+
 }

@@ -25,16 +25,20 @@ import reactor.core.scheduler.Schedulers;
 import reactor.test.StepVerifier;
 
 import software.amazon.awssdk.services.sns.SnsAsyncClient;
+import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
 import software.amazon.awssdk.services.sns.model.BatchResultErrorEntry;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequest;
 import software.amazon.awssdk.services.sns.model.PublishBatchRequestEntry;
 import software.amazon.awssdk.services.sns.model.PublishBatchResponse;
 import software.amazon.awssdk.services.sns.model.PublishBatchResultEntry;
+import software.amazon.awssdk.services.sns.model.SnsException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -221,6 +225,74 @@ class AsyncFifoSnsPublisherTest {
         StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events)))
             .expectNextCount(1)
             .verifyComplete();
+
+        verify(snsClient, times(2)).publishBatch(any(PublishBatchRequest.class));
+    }
+
+    @Test
+    void testPartialBatchFailureWithThrottlingExceptionCodeIsRetried() {
+        AtomicInteger attemptNumber = new AtomicInteger(0);
+
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+            .thenAnswer(invocation -> {
+                if (attemptNumber.incrementAndGet() == 1) {
+                    return CompletableFuture.completedFuture(
+                        PublishBatchResponse.builder()
+                            .failed(List.of(
+                                BatchResultErrorEntry.builder()
+                                    .id("dedup-0-0")
+                                    .code("ThrottlingException")
+                                    .message("Rate exceeded for this operation")
+                                    .senderFault(false)
+                                    .build()))
+                            .build());
+                }
+                return CompletableFuture.completedFuture(
+                    PublishBatchResponse.builder()
+                        .successful(List.of(
+                            PublishBatchResultEntry.builder().id("dedup-0-0").build()))
+                        .build());
+            });
+
+        List<SnsEvent> events = List.of(new SnsEvent("group1", "dedup-0", "payload-0"));
+
+        StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events)))
+            .expectNextCount(1)
+            .verifyComplete();
+
+        verify(snsClient, times(2)).publishBatch(any(PublishBatchRequest.class));
+    }
+
+    @Test
+    void testSnsExceptionWithRateExceededHttp400IsRetried() {
+        AtomicInteger attemptNumber = new AtomicInteger(0);
+
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+            .thenAnswer(invocation -> {
+                if (attemptNumber.incrementAndGet() == 1) {
+                    CompletableFuture<PublishBatchResponse> failed = new CompletableFuture<>();
+                    failed.completeExceptionally(SnsException.builder()
+                            .statusCode(400)
+                            .awsErrorDetails(AwsErrorDetails.builder()
+                                    .errorCode("ThrottlingException")
+                                    .errorMessage("Rate exceeded")
+                                    .build())
+                            .message("Rate exceeded")
+                            .build());
+                    return failed;
+                }
+                return CompletableFuture.completedFuture(
+                        PublishBatchResponse.builder()
+                                .successful(List.of(
+                                        PublishBatchResultEntry.builder().id("dedup-0-0").build()))
+                                .build());
+            });
+
+        List<SnsEvent> events = List.of(new SnsEvent("group1", "dedup-0", "payload-0"));
+
+        StepVerifier.create(publisher.publishEvents(Flux.fromIterable(events)))
+                .expectNextCount(1)
+                .verifyComplete();
 
         verify(snsClient, times(2)).publishBatch(any(PublishBatchRequest.class));
     }
@@ -740,5 +812,49 @@ class AsyncFifoSnsPublisherTest {
             new AsyncFifoSnsPublisher(snsClient, TOPIC_ARN, 10, Duration.ofMillis(50),
                 10_000, 100, 100, null, null),
             "rateLimiter cannot be null");
+    }
+
+    @Test
+    void throttledRetriesNotifyRateLimiterForEachAttempt() {
+        SnsRateLimiter rateLimiter = mock(SnsRateLimiter.class);
+        when(rateLimiter.acquirePermit(anyString(), anyInt())).thenReturn(reactor.core.publisher.Mono.empty());
+
+        AsyncFifoSnsPublisher rateLimitedPublisher = new AsyncFifoSnsPublisher(
+                snsClient, TOPIC_ARN, 10, Duration.ofMillis(10),
+                10_000, 100, 100, null, rateLimiter);
+
+        AtomicInteger attemptNumber = new AtomicInteger(0);
+        when(snsClient.publishBatch(any(PublishBatchRequest.class)))
+                .thenAnswer(invocation -> {
+                    int attempt = attemptNumber.incrementAndGet();
+                    if (attempt <= 2) {
+                        return CompletableFuture.completedFuture(
+                                PublishBatchResponse.builder()
+                                        .failed(List.of(
+                                                BatchResultErrorEntry.builder()
+                                                        .id("dedup-0-0")
+                                                        .code("ThrottlingException")
+                                                        .message("Rate exceeded")
+                                                        .senderFault(false)
+                                                        .build()))
+                                        .build());
+                    }
+                    return CompletableFuture.completedFuture(
+                            PublishBatchResponse.builder()
+                                    .successful(List.of(
+                                            PublishBatchResultEntry.builder().id("dedup-0-0").build()))
+                                    .build());
+                });
+
+        List<SnsEvent> events = List.of(new SnsEvent("group1", "dedup-0", "payload-0"));
+
+        StepVerifier.create(rateLimitedPublisher.publishEvents(Flux.fromIterable(events)))
+                .expectNextCount(1)
+                .verifyComplete();
+
+        verify(rateLimiter, times(2)).onThrottle("group1");
+        verify(rateLimiter, times(1)).onSuccess();
+
+        rateLimitedPublisher.destroy();
     }
 }

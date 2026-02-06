@@ -136,12 +136,12 @@ public class SnsRateLimiter implements DisposableBean {
         }
 
         return Mono.fromRunnable(() -> {
-            // 1 permit per API call at topic level
-            topicRateLimiter.acquire();
-
             // 1 permit per message at group level
             RateLimiter groupLimiter = getOrCreateGroupLimiter(messageGroupId);
             groupLimiter.acquire(messageCount);
+
+            // 1 permit per API call at topic level
+            topicRateLimiter.acquire();
         }).subscribeOn(blockingScheduler).then();
     }
 
@@ -229,13 +229,15 @@ public class SnsRateLimiter implements DisposableBean {
 
                 double currentRate = groupLimiter.getRate();
                 double targetRate = messagesPerGroupPerSecond * newFactor;
+                double effectiveRate = currentRate;
                 if (currentRate < targetRate) {
                     double newGroupRate = Math.min(currentRate * RECOVERY_INCREASE_FACTOR, targetRate);
                     groupLimiter.setRate(newGroupRate);
+                    effectiveRate = newGroupRate;
                     log.debug("Recovering rate for group '{}' to {}/sec", groupId, Math.round(newGroupRate * 10) / 10.0);
                 }
 
-                if (currentRate >= targetRate * RECOVERY_COMPLETION_THRESHOLD) {
+                if (effectiveRate >= targetRate * RECOVERY_COMPLETION_THRESHOLD) {
                     iterator.remove();
                 }
             }

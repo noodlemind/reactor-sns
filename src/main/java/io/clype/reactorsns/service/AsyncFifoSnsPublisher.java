@@ -5,6 +5,7 @@ import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -135,12 +136,23 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     /** Jitter factor for retry backoff (0.5 = 50% randomization). */
     private static final double RETRY_JITTER = 0.5;
 
-    /** AWS error code that indicates throttling (rate limiting). */
-    private static final String THROTTLING_ERROR_CODE = "Throttling";
+    /** AWS error codes that indicate throttling (rate limiting). */
+    private static final Set<String> THROTTLING_ERROR_CODES = Set.of(
+            "Throttling",
+            "Throttled",
+            "ThrottlingException",
+            "TooManyRequestsException",
+            "RequestThrottled",
+            "KMSThrottling",
+            "KMS.ThrottlingException"
+    );
+
+    /** Error message fragment that commonly indicates throttling with HTTP 400. */
+    private static final String RATE_EXCEEDED_MESSAGE = "rate exceeded";
 
     /** AWS error codes that indicate transient failures eligible for retry. */
     private static final Set<String> RETRYABLE_ERROR_CODES = Set.of(
-            "Throttling", "InternalError", "ServiceUnavailable"
+            "InternalError", "ServiceUnavailable", "KMSThrottling"
     );
 
     // ==========================================================================
@@ -170,6 +182,9 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     /** Headroom multiplier for queue capacity to accommodate in-flight work during processing. */
     private static final int QUEUE_HEADROOM_FACTOR = 2;
 
+    /** Upper bound for concurrent message groups processed within a single partition window. */
+    private static final int MAX_CONCURRENT_GROUPS_PER_WINDOW = 64;
+
     /** Maximum bit-shift for exponential backoff to prevent overflow. */
     private static final int MAX_BACKOFF_EXPONENT = 10;
 
@@ -192,6 +207,7 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     private final SnsPublisherMetrics metrics;
     private final SnsRateLimiter rateLimiter;
     private final Scheduler ioScheduler;
+    private final int maxConcurrentGroupsPerWindow;
 
     // ==========================================================================
     // Constructors
@@ -339,6 +355,8 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         this.bufferSize = bufferSize;
         this.partitionBufferSize = partitionBufferSize;
         this.metrics = metrics;
+        this.maxConcurrentGroupsPerWindow = Math.max(
+                1, Math.min(MAX_CONCURRENT_GROUPS_PER_WINDOW, partitionBufferSize));
 
         // Thread pool sized to match connection pool for I/O-bound work.
         // For network calls that spend most time waiting, threads ≈ connections is optimal.
@@ -483,8 +501,14 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
         // Process groups in parallel, batches within each group sequentially
         // Use flatMapDelayError to allow all groups to complete before propagating errors
         // This ensures one failing group doesn't cancel other independent groups
+        int maxGroupConcurrency = Math.min(byGroup.size(), maxConcurrentGroupsPerWindow);
+        if (byGroup.size() > maxConcurrentGroupsPerWindow) {
+            log.debug("Capping concurrent group processing in partition window at {} (groups in window: {})",
+                    maxConcurrentGroupsPerWindow, byGroup.size());
+        }
+
         return Flux.fromIterable(byGroup.values())
-                .flatMapDelayError(this::processGroupBatches, byGroup.size(), 1);
+                .flatMapDelayError(this::processGroupBatches, maxGroupConcurrency, 1);
     }
 
     /**
@@ -604,20 +628,8 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
                 .flatMap(response -> handleBatchResponse(response, batch))
                 .retryWhen(createRetrySpec(messageGroupId))
                 .doOnSuccess(response -> rateLimiter.onSuccess())
-                .doOnError(e -> {
-                    notifyRateLimiterOnThrottle(e, messageGroupId);
-                    log.error("Failed to publish batch after retries: {}",
-                            sanitizeForLog(e.getMessage()));
-                });
-    }
-
-    /**
-     * Notifies the rate limiter when a throttling error is detected.
-     */
-    private void notifyRateLimiterOnThrottle(Throwable e, String messageGroupId) {
-        if (isThrottlingException(e)) {
-            rateLimiter.onThrottle(messageGroupId);
-        }
+                .doOnError(e -> log.error("Failed to publish batch after retries: {}",
+                        sanitizeForLog(e.getMessage())));
     }
 
     /**
@@ -626,12 +638,13 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
     private boolean isThrottlingException(Throwable throwable) {
         if (throwable instanceof PartialBatchFailureException partialEx) {
             return partialEx.getFailedEntries().stream()
-                    .anyMatch(entry -> THROTTLING_ERROR_CODE.equals(entry.code()));
+                    .anyMatch(entry -> isThrottlingCode(entry.code()) || isRateExceededMessage(entry.message()));
         }
         if (throwable instanceof SnsException snsEx && snsEx.awsErrorDetails() != null) {
-            return THROTTLING_ERROR_CODE.equals(snsEx.awsErrorDetails().errorCode());
+            return isThrottlingCode(snsEx.awsErrorDetails().errorCode()) ||
+                    isRateExceededMessage(snsEx.awsErrorDetails().errorMessage());
         }
-        return false;
+        return isRateExceededMessage(throwable.getMessage());
     }
 
     /**
@@ -797,6 +810,11 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
             int maxRetries = isThrottling ? MAX_THROTTLE_RETRIES : MAX_RETRIES;
             Duration maxBackoff = isThrottling ? THROTTLE_RETRY_MAX_BACKOFF : RETRY_MAX_BACKOFF;
 
+            if (isThrottling) {
+                // React on every throttled attempt instead of waiting for retry exhaustion.
+                rateLimiter.onThrottle(messageGroupId);
+            }
+
             // Check if retryable
             if (!isRetryableException(failure)) {
                 return Mono.error(failure);
@@ -848,9 +866,36 @@ public class AsyncFifoSnsPublisher implements DisposableBean {
      */
     private boolean isRetryableSnsError(SnsException snsEx) {
         if (snsEx.awsErrorDetails() == null) {
-            return false;
+            return isRateExceededMessage(snsEx.getMessage());
+        }
+        if (isThrottlingException(snsEx)) {
+            return true;
         }
         return RETRYABLE_ERROR_CODES.contains(snsEx.awsErrorDetails().errorCode());
+    }
+
+    /**
+     * Returns true if the AWS error code represents throttling.
+     */
+    private boolean isThrottlingCode(String errorCode) {
+        if (errorCode == null || errorCode.isBlank()) {
+            return false;
+        }
+        if (THROTTLING_ERROR_CODES.contains(errorCode)) {
+            return true;
+        }
+        return errorCode.toLowerCase(Locale.ROOT).contains("throttl");
+    }
+
+    /**
+     * Returns true if the error message represents throttling/rate exhaustion.
+     */
+    private boolean isRateExceededMessage(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        String normalized = message.toLowerCase(Locale.ROOT);
+        return normalized.contains(RATE_EXCEEDED_MESSAGE) || normalized.contains("throttl");
     }
 
     /**
